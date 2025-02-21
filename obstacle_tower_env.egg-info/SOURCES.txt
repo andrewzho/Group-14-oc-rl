@@ -1,5 +1,6 @@
 LICENSE
 README.md
+obstacle_tower_env.py
 setup.py
 obstacle_tower_env.egg-info/PKG-INFO
 obstacle_tower_env.egg-info/SOURCES.txt
