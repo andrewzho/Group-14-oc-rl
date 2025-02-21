@@ -56,7 +56,7 @@ Alternatively, download the project files manually.
 This project uses a Conda environment for dependency management. Create and activate it as follows:
 
 ```bash
-conda create -n new-175-rl python=3.9   
+conda create -n new-175-rl python=3.8   
 conda activate new-175-rl
 ```
 
