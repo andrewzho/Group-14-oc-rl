@@ -83,6 +83,7 @@ def main():
             state = next_state
             if done:
                 episode_rewards.append(episode_reward)
+                np.save("rewards.npy", episode_rewards)
                 print(f"Episode reward: {episode_reward}")
                 episode_reward = 0
                 try:
