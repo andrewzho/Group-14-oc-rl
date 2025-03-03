@@ -11,6 +11,7 @@ import os
 from mlagents_envs.exception import UnityCommunicatorStoppedException
 import time
 import logging
+from src.create_env import create_obstacle_tower_env
 
 # Set Unity to run in headless mode
 os.environ['DISPLAY'] = ''
@@ -34,7 +35,7 @@ def main():
 
     # Environment setup
     logger.info("Setting up environment...")
-    env = ObstacleTowerEnv('./ObstacleTower/obstacletower', retro=False, realtime_mode=args.realtime)
+    env = create_obstacle_tower_env(realtime_mode=args.realtime)
     logger.info("Environment created")
     action_flattener = ActionFlattener(env.action_space.nvec)
     num_actions = action_flattener.action_space.n

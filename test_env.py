@@ -10,7 +10,7 @@ logger = logging.getLogger()
 logger.info("Starting environment test")
 try:
     logger.info("Creating environment")
-    env = ObstacleTowerEnv('./ObstacleTower/obstacletower', retro=False, realtime_mode=False)
+    env = ObstacleTowerEnv('./ObstacleTower/obstacletower.x86_64', retro=False, realtime_mode=False, timeout_wait=300)
     logger.info("Environment created successfully")
     
     logger.info("Resetting environment")
