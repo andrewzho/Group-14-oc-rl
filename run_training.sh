@@ -9,6 +9,10 @@
 #SBATCH --gres=gpu:V100:1     ## Type and the number of GPUs
 
 # Display job info
+# Set up virtual display
+export DISPLAY=:1
+Xvfb $DISPLAY -screen 0 1024x768x24 &
+
 echo "Job started at $(date)"
 echo "Running on host: $(hostname)"
 echo "Job ID: $SLURM_JOB_ID"
