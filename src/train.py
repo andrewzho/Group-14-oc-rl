@@ -10,9 +10,15 @@ from collections import deque
 import os
 from mlagents_envs.exception import UnityCommunicatorStoppedException
 import time
+import logging
 
 # Set Unity to run in headless mode
 os.environ['DISPLAY'] = ''
+
+# Add at the top of your train.py file
+logging.basicConfig(level=logging.INFO, 
+                    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
+logger = logging.getLogger('obstacle_tower')
 
 def main():
     parser = argparse.ArgumentParser(description="Train PPO agent for Obstacle Tower")
@@ -27,7 +33,9 @@ def main():
     os.makedirs(checkpoint_dir, exist_ok=True)
 
     # Environment setup
+    logger.info("Setting up environment...")
     env = ObstacleTowerEnv('./ObstacleTower/obstacletower', retro=False, realtime_mode=args.realtime)
+    logger.info("Environment created")
     action_flattener = ActionFlattener(env.action_space.nvec)
     num_actions = action_flattener.action_space.n
     print(f"Number of actions: {num_actions}")
@@ -74,8 +82,10 @@ def main():
         frame_stack = deque(maxlen=4)
 
         # Initialize frame stack
+        logger.info(f"Resetting environment...")
         try:
             obs = env.reset()
+            logger.info(f"Environment reset complete. Observation shape: {obs[0].shape}")
         except UnityCommunicatorStoppedException as e:
             print(f"Error during initial reset: {e}")
             env.close()
