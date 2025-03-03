@@ -1,13 +1,12 @@
 #!/bin/bash
-#SBATCH --job-name=obstacle_tower
-#SBATCH --output=obstacle_tower_%j.out
-#SBATCH --error=obstacle_tower_%j.err
-#SBATCH --time=24:00:00
-#SBATCH --nodes=1
-#SBATCH --ntasks=1
-#SBATCH --cpus-per-task=4
-#SBATCH --gres=gpu:1
-#SBATCH --mem=16G
+#SBATCH -A cs175_class_gpu    ## Account to charge
+#SBATCH --time=04:00:00       ## Maximum running time of program
+#SBATCH --nodes=1             ## Number of nodes.
+                              ## Set to 1 if you are using GPU.
+#SBATCH --partition=gpu       ## Partition name
+#SBATCH --mem=30GB            ## Allocated Memory
+#SBATCH --cpus-per-task 8    ## Number of CPU cores
+#SBATCH --gres=gpu:V100:1     ## Type and the number of GPUs
 
 echo "Job started at $(date)"
 echo "Running on host: $(hostname)"
