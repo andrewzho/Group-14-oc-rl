@@ -6,6 +6,7 @@ import os
 import matplotlib.pyplot as plt
 from datetime import datetime
 import json
+import warnings
 
 def to_python_type(value):
     """Convert NumPy or Torch types to Python native types"""
@@ -53,17 +54,70 @@ def load_checkpoint(model, path, optimizer=None, scheduler=None):
     """
     Load a model checkpoint including training metrics
     """
-    checkpoint = torch.load(path)
-    model.load_state_dict(checkpoint['model_state_dict'])
+    metrics = None
+    update_count = None
     
-    if optimizer is not None and 'optimizer_state_dict' in checkpoint:
-        optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
-    
-    if scheduler is not None and 'scheduler_state_dict' in checkpoint:
-        scheduler.load_state_dict(checkpoint['scheduler_state_dict'])
+    try:
+        # First, try to allow NumPy scalars in the safe globals list (PyTorch 2.0+)
+        try:
+            # This is a PyTorch 2.0+ feature
+            import torch.serialization
+            # Add numpy.core.multiarray.scalar to allowed globals
+            torch.serialization.add_safe_globals(['numpy.core.multiarray', 'scalar'])
+            
+            # Try loading with weights_only=True for better security
+            checkpoint = torch.load(path, weights_only=True)
+            model.load_state_dict(checkpoint['model_state_dict'])
+            print("Successfully loaded checkpoint with weights_only=True")
+            
+            # For optimizer and scheduler, we need to load the full checkpoint
+            if optimizer is not None or scheduler is not None or metrics is not None:
+                full_checkpoint = torch.load(path)
+                
+                if optimizer is not None and 'optimizer_state_dict' in full_checkpoint:
+                    optimizer.load_state_dict(full_checkpoint['optimizer_state_dict'])
+                
+                if scheduler is not None and 'scheduler_state_dict' in full_checkpoint:
+                    scheduler.load_state_dict(full_checkpoint['scheduler_state_dict'])
+                    
+                metrics = full_checkpoint.get('metrics', None)
+                update_count = full_checkpoint.get('update_count', None)
+                
+        except (AttributeError, ImportError, RuntimeError):
+            # If add_safe_globals is not available or fails, fall back
+            raise RuntimeError("Could not use add_safe_globals")
+            
+    except Exception as e:
+        # Fall back to regular loading for older PyTorch versions or if security features fail
+        warnings.warn(f"Falling back to regular checkpoint loading: {str(e)}")
         
-    metrics = checkpoint.get('metrics', None)
-    update_count = checkpoint.get('update_count', None)
+        try:
+            # Load without weights_only restriction - less secure but more compatible
+            checkpoint = torch.load(path, map_location=next(model.parameters()).device)
+            
+            # Load model state dict
+            if 'model_state_dict' in checkpoint:
+                model.load_state_dict(checkpoint['model_state_dict'])
+            else:
+                # Try direct loading in case the checkpoint is just the model state dict
+                model.load_state_dict(checkpoint)
+            
+            # Load optimizer if provided
+            if optimizer is not None and 'optimizer_state_dict' in checkpoint:
+                optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
+            
+            # Load scheduler if provided
+            if scheduler is not None and 'scheduler_state_dict' in checkpoint:
+                scheduler.load_state_dict(checkpoint['scheduler_state_dict'])
+                
+            metrics = checkpoint.get('metrics', None)
+            update_count = checkpoint.get('update_count', None)
+            
+            print("Successfully loaded checkpoint without weights_only")
+            
+        except Exception as load_err:
+            print(f"Error loading checkpoint: {load_err}")
+            raise
     
     return model, metrics, update_count
 

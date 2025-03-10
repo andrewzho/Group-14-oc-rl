@@ -78,6 +78,35 @@ def main(args):
     Args:
         args: Command line arguments
     """
+    # Check if we're just running evaluation mode
+    if args.evaluate_only and args.checkpoint:
+        print(f"Running in evaluation-only mode using checkpoint: {args.checkpoint}")
+        try:
+            # Import and run the evaluation code
+            from src.evaluate import main as evaluate_main
+            import argparse
+            
+            # Create a proper eval_args with all required fields
+            eval_args = argparse.Namespace(
+                env_path=args.env_path,
+                seed=args.seed,
+                floor=args.starting_floor,  # Map to the equivalent evaluate.py argument
+                checkpoint=args.checkpoint,
+                device=args.device,
+                deterministic=0.9,  # Default for evaluation
+                episodes=args.eval_episodes,
+                max_ep_steps=2000,  # Reasonable default
+                render=True,  # Always render in evaluation mode
+                video_path=args.video_path
+            )
+            
+            # Call the evaluation function
+            evaluate_main(eval_args)
+        except Exception as e:
+            print(f"Error during evaluation: {e}")
+            traceback.print_exc()
+        return
+        
     # Set up device
     device = torch.device(args.device)
     print(f"Using device: {device}")
@@ -86,8 +115,8 @@ def main(args):
     print("INFO:obstacle_tower:Setting up environment...")
     env = create_obstacle_tower_env(
         executable_path=args.env_path,
-        realtime_mode=False,
-        no_graphics=True
+        realtime_mode=args.realtime_mode,
+        no_graphics=not args.render
     )
     print("INFO:obstacle_tower:Environment created")
     
@@ -99,9 +128,11 @@ def main(args):
         }
         curriculum_attempts = 0
         curriculum_successes = 0
+        curriculum_success_streak = 0
         current_curriculum_floor = 0
-        curriculum_success_threshold = 3
-        curriculum_attempt_threshold = 10
+        curriculum_success_threshold = 5  # Increased from 3 - require more successes
+        curriculum_attempt_threshold = 15  # Increased from 10 - give more attempts
+        curriculum_floor_success_history = {}  # Track success rate per floor
     else:
         curriculum_config = None
 
@@ -236,8 +267,54 @@ def main(args):
         if buffer_size == 0:
             return [], [], [], [], []  # Return empty lists if buffer is empty
             
-        # Sample indices
-        indices = np.random.choice(buffer_size, min(buffer_size, batch_size), replace=False)
+        # Create priority weights based on rewards, floors, and recency
+        priorities = np.ones(buffer_size)
+        
+        # 1. Prioritize based on rewards - higher rewards get higher priority
+        abs_rewards = np.abs(np.array(replay_buffer['rewards']))
+        if abs_rewards.max() > 0:
+            reward_priorities = abs_rewards / abs_rewards.max()
+            priorities *= (1.0 + reward_priorities)
+        
+        # 2. Prioritize recent experiences - more recent samples get higher priority
+        recency_factor = 2.0
+        recency_priorities = np.linspace(1.0, recency_factor, buffer_size)
+        priorities *= recency_priorities
+        
+        # 3. Try to extract floor information and prioritize higher floors
+        # This is a simplified approximation - adapt to your state representation
+        try:
+            # Extract floor info if available
+            floor_info = []
+            for i in range(buffer_size):
+                # For this example, we're using a simple heuristic
+                # In practice, you should extract actual floor info if available
+                floor = 0  # Default floor
+                
+                # Estimate floor from reward magnitude as a heuristic
+                if replay_buffer['rewards'][i] > 5.0:
+                    floor = min(5, int(replay_buffer['rewards'][i] / 5.0))
+                
+                floor_info.append(floor)
+            
+            if len(floor_info) > 0 and max(floor_info) > 0:
+                floor_priorities = np.array(floor_info) / max(1, max(floor_info))
+                # Higher floors get much higher priority
+                floor_boost = 1.0 + 2.0 * floor_priorities
+                priorities *= floor_boost
+        except Exception as e:
+            print(f"Error calculating floor priorities: {e}")
+        
+        # Normalize priorities to create a valid probability distribution
+        priorities = priorities / priorities.sum()
+        
+        # Sample indices based on priorities
+        indices = np.random.choice(
+            buffer_size, 
+            min(buffer_size, batch_size), 
+            replace=False,
+            p=priorities
+        )
         
         # Extract batch
         batch_states = [replay_buffer['states'][i] for i in indices]
@@ -389,26 +466,94 @@ def main(args):
                 if 'done' in locals() and done:  # Check if 'done' exists and is True
                     curriculum_attempts += 1
                     
-                    # Check if agent completed the floor
-                    if info["current_floor"] > current_curriculum_floor:
+                    # Track floor-specific success rate
+                    floor_reached = info["current_floor"]
+                    if floor_reached not in curriculum_floor_success_history:
+                        curriculum_floor_success_history[floor_reached] = {
+                            'attempts': 0,
+                            'successes': 0
+                        }
+                    curriculum_floor_success_history[floor_reached]['attempts'] += 1
+                    
+                    # Check if agent reached or exceeded target floor
+                    if floor_reached >= current_curriculum_floor:
                         curriculum_successes += 1
-                        training_logger.log(f"Curriculum success! {curriculum_successes}/{curriculum_success_threshold} successes at floor {current_curriculum_floor}", "CURRICULUM")
+                        curriculum_success_streak += 1
                         
-                        # If agent has had enough successes, increase difficulty
-                        if curriculum_successes >= curriculum_success_threshold:
+                        # Record as success for this floor
+                        curriculum_floor_success_history[floor_reached]['successes'] += 1
+                        
+                        success_rate = curriculum_floor_success_history[floor_reached]['successes'] / \
+                                       curriculum_floor_success_history[floor_reached]['attempts']
+                        
+                        training_logger.log(
+                            f"Curriculum success! {curriculum_successes}/{curriculum_success_threshold} " + 
+                            f"successes at floor {current_curriculum_floor}. " +
+                            f"Success streak: {curriculum_success_streak}. " +
+                            f"Success rate: {success_rate:.2f}",
+                            "CURRICULUM"
+                        )
+                        
+                        # If agent has a strong success streak, increase difficulty faster
+                        if curriculum_success_streak >= curriculum_success_threshold:
                             current_curriculum_floor += 1
                             curriculum_successes = 0
                             curriculum_attempts = 0
+                            curriculum_success_streak = 0
                             curriculum_config["starting-floor"] = current_curriculum_floor
-                            training_logger.log(f"Curriculum difficulty increased to floor {current_curriculum_floor}", "CURRICULUM")
+                            training_logger.log(
+                                f"Curriculum difficulty increased to floor {current_curriculum_floor} " +
+                                f"after {curriculum_success_threshold} consecutive successes!", 
+                                "CURRICULUM"
+                            )
+                        # Otherwise, if accumulated enough total successes
+                        elif curriculum_successes >= curriculum_success_threshold * 2:
+                            current_curriculum_floor += 1
+                            curriculum_successes = 0
+                            curriculum_attempts = 0
+                            curriculum_success_streak = 0
+                            curriculum_config["starting-floor"] = current_curriculum_floor
+                            training_logger.log(
+                                f"Curriculum difficulty increased to floor {current_curriculum_floor} " +
+                                f"after {curriculum_success_threshold * 2} total successes.", 
+                                "CURRICULUM"
+                            )
+                    else:
+                        # Reset streak if failed to reach target floor
+                        curriculum_success_streak = 0
+                        training_logger.log(
+                            f"Curriculum failure. Only reached floor {floor_reached}, " +
+                            f"target was {current_curriculum_floor}. Streak reset.",
+                            "CURRICULUM"
+                        )
                     
                     # If agent is struggling, decrease difficulty
-                    elif curriculum_attempts >= curriculum_attempt_threshold and current_curriculum_floor > 0:
-                        current_curriculum_floor = max(0, current_curriculum_floor - 1)
-                        curriculum_successes = 0
-                        curriculum_attempts = 0
-                        curriculum_config["starting-floor"] = current_curriculum_floor
-                        training_logger.log(f"Curriculum difficulty decreased to floor {current_curriculum_floor}", "CURRICULUM")
+                    if curriculum_attempts >= curriculum_attempt_threshold and current_curriculum_floor > 0:
+                        # Calculate success rate for current floor
+                        curr_floor_stats = curriculum_floor_success_history.get(current_curriculum_floor, 
+                                                                              {'attempts': 0, 'successes': 0})
+                        success_rate = curr_floor_stats['successes'] / max(1, curr_floor_stats['attempts'])
+                        
+                        # If success rate is low, decrease difficulty
+                        if success_rate < 0.3:
+                            current_curriculum_floor = max(0, current_curriculum_floor - 1)
+                            curriculum_successes = 0
+                            curriculum_attempts = 0
+                            curriculum_success_streak = 0
+                            curriculum_config["starting-floor"] = current_curriculum_floor
+                            training_logger.log(
+                                f"Curriculum difficulty decreased to floor {current_curriculum_floor} " +
+                                f"due to low success rate ({success_rate:.2f}).", 
+                                "CURRICULUM"
+                            )
+                        else:
+                            # Keep current floor but reset counters
+                            curriculum_attempts = 0
+                            training_logger.log(
+                                f"Maintaining curriculum difficulty at floor {current_curriculum_floor}. " +
+                                f"Current success rate: {success_rate:.2f}", 
+                                "CURRICULUM"
+                            )
                 
                 # Apply curriculum settings to environment
                 for key, value in curriculum_config.items():
@@ -476,9 +621,25 @@ def main(args):
                 current_floor = info["current_floor"]
                 if current_floor > max_floor_reached:
                     max_floor_reached = current_floor
-                floor_msg = f"New floor reached: {current_floor}"
-                print(floor_msg)
-                training_logger.log_significant_event("FLOOR", floor_msg)
+                    floor_msg = f"New floor reached: {current_floor}"
+                    print(floor_msg)
+                    training_logger.log_significant_event("FLOOR", floor_msg)
+                    
+                    # Add direct floor checkpoint saving here
+                    try:
+                        floor_checkpoint_path = os.path.join(args.log_dir, f"floor_{current_floor}.pth")
+                        save_checkpoint(
+                            model, 
+                            floor_checkpoint_path,
+                            optimizer=ppo.optimizer,
+                            scheduler=ppo.scheduler,
+                            metrics=None,  # Don't save metrics to keep file smaller
+                            update_count=update_count
+                        )
+                        print(f"CHECKPOINT: Saved floor checkpoint to {floor_checkpoint_path}")
+                    except Exception as e:
+                        print(f"ERROR saving floor checkpoint: {e}")
+                        traceback.print_exc()
             
             # Enhanced reward shaping
             move_idx, rot_idx, jump_idx, _ = action
@@ -571,40 +732,140 @@ def main(args):
             shaped_reward += time_penalty
             reward_components['time_penalty'] += time_penalty
             
-            # Enhanced exploration bonus based on visit count, but with decay
+            # Enhanced exploration bonus based on visit count, with better scaling
             visit_count = info.get("visit_count", 0)
-            # Calculate training progress for decaying exploration
-            progress = min(1.0, steps_done / (0.5 * max_steps))  # Decay over first half of training
-            exploration_decay = max(0.2, 1.0 - progress)  # Decay from 1.0 to 0.2
+            current_floor = info.get("current_floor", 0)
             
+            # Calculate adaptive exploration factors
+            # 1. Base exploration factor starts high and decays over training, but maintains a minimum value
+            progress = min(1.0, steps_done / (0.8 * max_steps))  # Slower decay over 80% of training
+            base_exploration_factor = max(0.3, 1.0 - progress)  # Decay from 1.0 to 0.3
+            
+            # 2. Floor-specific factor - higher floors get higher exploration bonuses
+            floor_factor = 1.0 + 0.2 * current_floor  # Each floor increases exploration bonus by 20%
+            
+            # 3. Uncertainty factor - areas visited less get higher bonuses
             if visit_count is not None:
                 if visit_count == 0:  # Never visited before
-                    exploration_bonus = 0.05 * exploration_decay  # Reduced and decaying over time
-                    shaped_reward += exploration_bonus
-                    reward_components['exploration_bonus'] += exploration_bonus
+                    uncertainty = 1.0  # Maximum uncertainty
                 elif visit_count < 3:  # Visited only a few times
-                    exploration_bonus = 0.02 * exploration_decay  # Reduced and decaying over time
+                    uncertainty = 0.7  # High uncertainty
+                elif visit_count < 10:  # Visited several times
+                    uncertainty = 0.4  # Medium uncertainty
+                else:  # Visited many times
+                    uncertainty = 0.2  # Low uncertainty
+                
+                # Calculate final exploration bonus with all factors
+                exploration_bonus = 0.1 * base_exploration_factor * floor_factor * uncertainty
+                
+                if exploration_bonus > 0:
                     shaped_reward += exploration_bonus
                     reward_components['exploration_bonus'] += exploration_bonus
+                    
+                    # Log significant exploration bonuses
+                    if exploration_bonus > 0.05 and steps_done % 100 == 0:
+                        training_logger.log(
+                            f"Exploration bonus: +{exploration_bonus:.3f} " +
+                            f"(floor: {current_floor}, visits: {visit_count})",
+                            "EXPLORATION"
+                        )
             
-            # Also reward distance moved but with lower weight
+            # Enhance movement reward with directional bias toward unexplored areas
             if hasattr(env, '_previous_position') and env._previous_position is not None:
                 # Calculate distance moved
                 distance = sum((current_position[i] - env._previous_position[i])**2 for i in range(3))**0.5
-                if distance > 0.5:  # If moved significantly
-                    distance_bonus = 0.005 * distance * exploration_decay  # Reduced and decaying
-                    shaped_reward += distance_bonus
-                    reward_components['exploration_bonus'] += distance_bonus
+                
+                # Higher reward for significant movement
+                if distance > 0.5:
+                    # Get movement direction
+                    if distance > 0:
+                        direction = [(current_position[i] - env._previous_position[i])/distance 
+                                    for i in range(3)]
+                    else:
+                        direction = [0, 0, 0]
+                    
+                    # Check if agent is moving toward unexplored areas
+                    target_info = key_door_memory.get_directions_to_target(
+                        current_position, current_floor, current_keys > 0
+                    )
+                    
+                    directional_bonus = 0.0
+                    
+                    if target_info:
+                        # Calculate dot product to see if agent is moving toward target
+                        target_dir = target_info['direction']
+                        dot_product = sum(direction[i] * target_dir[i] for i in range(min(len(direction), len(target_dir))))
+                        
+                        # Higher reward for moving toward targets
+                        if dot_product > 0:
+                            # Scale by how aligned the movement is with target direction
+                            alignment_factor = (dot_product + 1) / 2  # Scale from 0-1
+                            directional_bonus = 0.02 * distance * alignment_factor * floor_factor
+                    else:
+                        # Basic movement bonus when no targets known
+                        directional_bonus = 0.01 * distance * floor_factor
+                    
+                    if directional_bonus > 0:
+                        shaped_reward += directional_bonus
+                        reward_components['exploration_bonus'] += directional_bonus
+            
+            # Store current position for next step comparison
             env._previous_position = current_position
                 
-            # Floor completion bonus - already handled by environment but ensure it's significant
+            # Enhanced floor completion bonus with progressive scaling
             if info["current_floor"] > current_floor:
-                floor_bonus = 2.0  # Doubled from 1.0 to prioritize floor progression
+                # Progressive floor bonus - higher floors get bigger rewards
+                base_floor_bonus = 2.0
+                floor_progression = info["current_floor"] - current_floor
+                floor_bonus = base_floor_bonus * (1 + 0.5 * floor_progression)  # +50% per floor skipped
+                
                 shaped_reward += floor_bonus
                 episodic_memory.mark_floor_complete(current_floor)
-                current_floor = info["current_floor"]
+                key_door_memory.mark_floor_complete(current_floor)
+                
+                # Track floor achievement
+                new_floor = info["current_floor"]
+                if new_floor > max_floor_reached:
+                    max_floor_reached = new_floor
+                    metrics_tracker.update('max_floor_reached', max_floor_reached)
+                    
+                    # Additional milestone bonus for reaching a new max floor
+                    if new_floor > current_floor + 1:  # Skip multiple floors
+                        milestone_bonus = 5.0  # Substantial bonus for significant progress
+                        shaped_reward += milestone_bonus
+                        print(f"Milestone achieved! Reached new max floor {new_floor}! +{milestone_bonus} bonus")
+                        training_logger.log_significant_event(
+                            "NEW_MAX_FLOOR", 
+                            f"Reached new maximum floor {new_floor} (skipped {new_floor - current_floor - 1} floors)"
+                        )
+                    else:
+                        print(f"Reached new max floor {new_floor}!")
+                        training_logger.log_significant_event(
+                            "NEW_MAX_FLOOR", 
+                            f"Reached new maximum floor {new_floor}"
+                        )
+                
+                # Update current floor to the new floor
+                current_floor = new_floor
                 reward_components['floor_bonus'] += floor_bonus
                 print(f"New floor reached: {current_floor}! Bonus reward added: +{floor_bonus}")
+                
+                # Reset exploration tracking for new floor
+                if hasattr(env, '_visited_positions'):
+                    env._visited_positions = {}
+                    print("Reset exploration tracking for new floor")
+                
+                # Add extra hint reward if we have keys to indicate they might be needed
+                if info["total_keys"] > 0:
+                    key_usage_hint = 1.0
+                    shaped_reward += key_usage_hint
+                    print(f"Carrying keys to new floor! +{key_usage_hint} reward")
+                    
+                # Log the significant achievement
+                training_logger.log_significant_event(
+                    "FLOOR_COMPLETE", 
+                    f"Completed floor {current_floor-1}, moving to floor {current_floor}"
+                )
             
             # Log detailed environment interaction if verbose
             if steps_done % 100 == 0:
@@ -626,39 +887,88 @@ def main(args):
             # Check for key detection
             key_detected = detect_key_visually(next_obs[0], previous_obs)
             if key_detected:
-                # Extra visual reward
-                key_visual_bonus = 2.0
+                # Extra visual reward - increased from 2.0 to 3.0
+                key_visual_bonus = 3.0
                 shaped_reward += key_visual_bonus
                 print(f"Key visually detected! +{key_visual_bonus} reward")
                 
                 # Update memory with current position
                 current_position = (info.get("x_pos", 0), info.get("y_pos", 0), info.get("z_pos", 0))
                 key_door_memory.add_key_location(info["current_floor"], current_position)
+                # Track key collection for metrics
+                key_collections += 1
+                metrics_tracker.update('key_collections', key_collections)
+                training_logger.log_significant_event("KEY", f"Key detected at floor {info['current_floor']}, position {current_position}")
+
+            # Check for key collection by comparing with previous state
+            has_key = info["total_keys"] > 0
+            if hasattr(env, '_previous_keys') and env._previous_keys is not None:
+                if has_key and env._previous_keys == 0:
+                    # Additional reward for actually collecting the key
+                    key_collection_bonus = 4.0
+                    shaped_reward += key_collection_bonus
+                    print(f"Key collected! +{key_collection_bonus} reward")
+                    training_logger.log_significant_event("KEY_COLLECTED", f"Key collected at floor {info['current_floor']}")
+            # Update the key count tracker
+            env._previous_keys = info["total_keys"]
 
             # Enhance key possession awareness
-            if info["total_keys"] > 0:
+            if has_key:
                 # If agent has keys, provide a consistent small bonus
-                has_key_bonus = 0.05
+                has_key_bonus = 0.1  # Increased from 0.05
                 shaped_reward += has_key_bonus
                 
                 # Check for doors visually when agent has keys
                 door_detected = detect_door_visually(next_obs[0])
                 if door_detected:
-                    door_visual_bonus = 0.2
+                    door_visual_bonus = 0.5  # Increased from 0.2
                     shaped_reward += door_visual_bonus
                     print(f"Door visually detected with key! +{door_visual_bonus} reward")
                     
-                # Add proximity bonus based on memory
+                    # Store door position in memory
+                    door_position = (info.get("x_pos", 0), info.get("y_pos", 0), info.get("z_pos", 0))
+                    key_door_memory.add_door_location(info["current_floor"], door_position)
+                    
+                # Check for door opening by key loss
+                if hasattr(env, '_previous_keys') and env._previous_keys > info["total_keys"]:
+                    # Key was used - likely opened a door
+                    door_open_bonus = 5.0  # New substantial reward for using a key
+                    shaped_reward += door_open_bonus
+                    print(f"Door opened with key! +{door_open_bonus} reward")
+                    door_openings += 1
+                    metrics_tracker.update('door_openings', door_openings)
+                    training_logger.log_significant_event("DOOR_OPENED", f"Door opened at floor {info['current_floor']}")
+                    
+                    # Store successful key-door interaction
+                    if hasattr(env, '_last_key_position') and env._last_key_position is not None:
+                        key_door_memory.store_key_door_sequence(
+                            env._last_key_position, 
+                            current_position, 
+                            info["current_floor"]
+                        )
+                
+                # Add proximity bonus based on memory - enhanced version
                 door_proximity_bonus = key_door_memory.get_proximity_bonus(
                     current_position, info["current_floor"], has_key=True
                 )
+                # Apply a multiplier to make proximity more significant
+                door_proximity_bonus *= 1.5
                 shaped_reward += door_proximity_bonus
+                
+                # Store position where key was obtained
+                if not hasattr(env, '_last_key_position') or env._last_key_position is None:
+                    env._last_key_position = current_position
             else:
-                # Add key proximity bonus when agent has no keys
+                # Add key proximity bonus when agent has no keys - enhanced
                 key_proximity_bonus = key_door_memory.get_proximity_bonus(
                     current_position, info["current_floor"], has_key=False
                 )
+                # Apply a multiplier to make proximity more significant
+                key_proximity_bonus *= 1.5
                 shaped_reward += key_proximity_bonus
+                
+                # Reset key position tracking
+                env._last_key_position = None
 
             next_obs = np.transpose(next_obs[0], (2, 0, 1)) / 255.0
             frame_stack.append(next_obs)
@@ -692,7 +1002,7 @@ def main(args):
                     episode_count += 1
                     metrics_tracker.update('episode_rewards', episode_reward)
                     metrics_tracker.update('episode_lengths', episode_length)
-                    metrics_tracker.update('episode_floors', info["current_floor"])
+                    metrics_tracker.update('episode_floors', info['current_floor'])
                     
                     elapsed_time = time.time() - start_time
                     steps_per_sec = steps_done / elapsed_time
@@ -762,23 +1072,74 @@ def main(args):
         
         # Perform PPO update after collecting enough steps
         if len(replay_buffer['states']) >= ppo.batch_size:
-            # Sample from replay buffer
+            # Log replay buffer stats before sampling
+            buffer_size = len(replay_buffer['states'])
+            
+            # Calculate floor distribution in the buffer for adaptive sampling
+            floor_distribution = {}
+            for i in range(buffer_size):
+                # Extract floor info if available in state or use default
+                obs_floor = 0  # Default floor
+                if isinstance(replay_buffer['states'][i], np.ndarray) and replay_buffer['states'][i].shape[0] > 0:
+                    # Try to extract floor from observation if available
+                    # This is a simplified example - adapt to your state representation
+                    obs_floor = int(np.mean(replay_buffer['states'][i][:10]) * 10) % 10  # Simple heuristic
+                
+                if obs_floor not in floor_distribution:
+                    floor_distribution[obs_floor] = 0
+                floor_distribution[obs_floor] += 1
+            
+            # Log floor distribution when significant
+            if steps_done % 10000 == 0:
+                floor_dist_str = ", ".join([f"Floor {f}: {c}" for f, c in sorted(floor_distribution.items())])
+                training_logger.log(f"Replay buffer floor distribution: {floor_dist_str}", "REPLAY")
+            
+            # Sample from replay buffer with priority for higher floors
             states, actions, returns, advantages, old_log_probs = sample_from_replay(
                 replay_buffer, ppo.batch_size
             )
             
-            # Update policy
-            metrics = ppo.update(states, actions, old_log_probs, returns, advantages)
-            update_count += 1  # Increment update counter
-            
-            # Log metrics
-            training_logger.log_update(metrics)
-            
-            # Clear replay buffer after update
-            replay_buffer = {
-                'states': [], 'actions': [], 'rewards': [],
-                'log_probs': [], 'values': [], 'dones': []
-            }
+            # Check if we have enough samples
+            if len(states) >= ppo.batch_size // 2:  # Allow for smaller batch if needed
+                # Update policy
+                metrics = ppo.update(states, actions, old_log_probs, returns, advantages)
+                update_count += 1  # Increment update counter
+                
+                # Log metrics with more detail
+                update_summary = (
+                    f"Update {update_count}: " +
+                    f"Policy Loss: {metrics['policy_loss']:.4f}, " +
+                    f"Value Loss: {metrics['value_loss']:.4f}, " +
+                    f"Entropy: {metrics['entropy']:.4f}, " +
+                    f"KL: {metrics['approx_kl']:.4f}, " +
+                    f"LR: {metrics['learning_rate']:.6f}"
+                )
+                print(update_summary)
+                training_logger.log_update(metrics)
+                
+                # Adaptive entropy regulation - increase entropy if stuck on a floor
+                if current_floor <= 2 and update_count % 50 == 0:
+                    # Check if we've been stuck on the same floor for a while
+                    if len(metrics_tracker.metrics.get('episode_floors', [])) > 10:
+                        recent_floors = metrics_tracker.metrics['episode_floors'][-10:]
+                        max_recent_floor = max(recent_floors) if recent_floors else 0
+                        
+                        if max_recent_floor <= 2:
+                            # We're stuck on early floors - increase entropy temporarily
+                            old_entropy = ppo.ent_reg
+                            ppo.ent_reg = min(0.1, ppo.ent_reg * 1.5)  # Increase entropy up to 0.1
+                            training_logger.log(
+                                f"Increasing entropy from {old_entropy:.4f} to {ppo.ent_reg:.4f} to escape floor {max_recent_floor}",
+                                "TUNING"
+                            )
+                
+                # Clear replay buffer after update
+                replay_buffer = {
+                    'states': [], 'actions': [], 'rewards': [],
+                    'log_probs': [], 'values': [], 'dones': []
+                }
+            else:
+                training_logger.log(f"Skipping update - not enough samples ({len(states)}/{ppo.batch_size})", "UPDATE")
         
         # Run evaluation periodically
         if steps_done - last_eval_time >= args.eval_interval:
@@ -814,8 +1175,8 @@ def main(args):
             # Update metrics tracker with PPO metrics
             metrics_tracker.update_from_ppo(ppo)
             
-            # Save metrics and plot
-            metrics_tracker.save()
+            # Save metrics without plotting
+            metrics_tracker.save(plot=False)
             
             # Save checkpoint
             checkpoint_path = os.path.join(args.log_dir, f"step_{steps_done}.pth")
@@ -835,9 +1196,41 @@ def main(args):
         if update_count % 200 == 0 or ppo.optimizer.param_groups[0]['lr'] < 5e-5:
             ppo.reset_optimizer_state()
 
+        # Apply floor-specific reward scaling to prioritize progression
+        # Lower floors get reduced reward scale over time to encourage moving higher
+        floor_scaling_factor = 1.0
+        
+        # Gradually reduce reward scale for easier floors as training progresses
+        if steps_done > 100000:  # After initial learning period
+            current_max_floor = max_floor_reached
+            progress_ratio = min(1.0, steps_done / max_steps)
+            
+            # Calculate floor-specific scaling
+            # Floors far below the max get diminished rewards
+            if current_floor < current_max_floor - 1:
+                # Scale down rewards for floors more than 1 below max
+                floor_gap = current_max_floor - current_floor
+                # Stronger reduction as training progresses and gap increases
+                reduction = 0.3 * progress_ratio * min(floor_gap, 3)  # Cap at 3 floors difference
+                floor_scaling_factor = max(0.5, 1.0 - reduction)  # Don't go below 50%
+                
+                # Log when we apply significant scaling
+                if floor_scaling_factor < 0.8 and step % 100 == 0:
+                    training_logger.log(
+                        f"Applying floor scaling factor {floor_scaling_factor:.2f} " +
+                        f"(floor {current_floor} vs max {current_max_floor})",
+                        "REWARD_SHAPING"
+                    )
+            elif current_floor >= current_max_floor:
+                # Bonus scaling for pushing to new floors
+                floor_scaling_factor = 1.2  # 20% bonus for being at the frontier
+            
+            # Apply the scaling factor
+            shaped_reward *= floor_scaling_factor
+
     # Final save
     metrics_tracker.update_from_ppo(ppo)
-    metrics_tracker.save()
+    metrics_tracker.save(plot=False)  # Don't generate plots
     
     final_checkpoint_path = os.path.join(args.log_dir, "final_model.pth")
     save_checkpoint(
@@ -912,6 +1305,20 @@ if __name__ == "__main__":
                         help='Path to checkpoint to resume training from')
     parser.add_argument('--log_dir', type=str, default=None,
                         help='Directory for logs and checkpoints')
+    
+    # Visualization settings
+    parser.add_argument('--render', action='store_true',
+                        help='Render the environment')
+    parser.add_argument('--realtime_mode', action='store_true',
+                        help='Run the environment in realtime mode')
+    parser.add_argument('--video_path', type=str, default=None,
+                        help='Path to save video of agent evaluation')
+    
+    # Evaluation-only mode
+    parser.add_argument('--evaluate_only', action='store_true',
+                        help='Only run evaluation, no training (requires --checkpoint)')
+    parser.add_argument('--starting_floor', type=int, default=None,
+                        help='Starting floor for evaluation (only used with --evaluate_only)')
     
     args = parser.parse_args()
     
