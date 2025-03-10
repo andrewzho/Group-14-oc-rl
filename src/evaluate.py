@@ -10,14 +10,16 @@ import os
 import time
 import warnings
 from src.create_env import create_obstacle_tower_env
+import matplotlib.pyplot as plt
+from PIL import Image
 
-# Import cv2 for visualization
+# Ensure cv2 is conditionally imported only when needed
 try:
     import cv2
     CV2_AVAILABLE = True
 except ImportError:
-    warnings.warn("OpenCV (cv2) not found. Visualization may be limited.")
     CV2_AVAILABLE = False
+    print("OpenCV (cv2) not available - visualization features will be limited")
 
 # Try to import imageio as fallback for video creation
 try:
@@ -25,268 +27,292 @@ try:
     IMAGEIO_AVAILABLE = True
 except ImportError:
     IMAGEIO_AVAILABLE = False
+    print("imageio not available - fallback video saving will not work")
 
-def main(args):
+def evaluate_agent(env, model, action_flattener, device, episodes=10, max_steps=1000, render=False, realtime_mode=False, 
+                  starting_floor=None, video_path=None):
     """
-    Run a trained agent in the Obstacle Tower environment.
-    
-    Args:
-        args: Command line arguments
+    Evaluate the agent for a number of episodes
     """
-    # Add default values for potentially missing args
-    if not hasattr(args, 'render'):
-        args.render = True
-    if not hasattr(args, 'deterministic'):
-        args.deterministic = 0.9
-    if not hasattr(args, 'max_ep_steps'):
-        args.max_ep_steps = 2000
-    if not hasattr(args, 'episodes'):
-        args.episodes = 5
-    if not hasattr(args, 'video_path'):
-        args.video_path = None
-    if not hasattr(args, 'floor'):
-        args.floor = None
-    if not hasattr(args, 'seed'):
-        args.seed = None
-    
-    # Set up device
-    device = torch.device(args.device)
-    print(f"Using device: {device}")
-    
-    # Create environment with visualization if requested
-    env = create_obstacle_tower_env(
-        executable_path=args.env_path,
-        realtime_mode=True,  # Always use realtime for visualization
-        no_graphics=not args.render  # Allow graphics for rendering
-    )
-    print("Environment created")
-    
-    # Set up action flattener
-    action_flattener = ActionFlattener(env.action_space.nvec)
-    num_actions = action_flattener.action_space.n
-    print(f"Number of actions: {num_actions}")
+    # Set rendering and realtime modes properly
+    if hasattr(env, 'engine_config'):
+        # Set time scale based on realtime_mode
+        if realtime_mode:
+            env.engine_config.set_configuration_parameters(time_scale=1.0)
+        else:
+            env.engine_config.set_configuration_parameters(time_scale=20.0)
 
-    # Create model
-    model = PPONetwork(input_shape=(12, 84, 84), num_actions=num_actions).to(device)
+    if starting_floor is not None:
+        env.floor(starting_floor)
     
-    # Load checkpoint
-    if not args.checkpoint:
-        print("Error: Must provide a checkpoint to evaluate")
-        return
+    # Get action dimension from the flattener
+    action_dim = action_flattener.action_space.n
     
-    print(f"Loading checkpoint from {args.checkpoint}")
-    model, _, _ = load_checkpoint(model, args.checkpoint)
-    model.eval()  # Set to evaluation mode
+    returns = []
+    floors_reached = []
+    steps_per_episode = []
     
-    # Initialize video frames list if needed
-    if args.render and args.video_path:
-        if not hasattr(main, 'video_frames'):
-            main.video_frames = []
-    
-    # Check visualization capabilities
-    can_visualize = args.render and CV2_AVAILABLE
-    if args.render and not CV2_AVAILABLE:
-        print("Warning: OpenCV (cv2) not available. Live visualization disabled.")
-        if not args.video_path:
-            print("No video path specified and OpenCV not available. Disabling rendering.")
-            args.render = False
-    
-    # Run episodes
-    total_rewards = []
-    max_floors = []
-    episode_floors = []
-    
-    print(f"Running {args.episodes} episodes...")
-    
-    for episode in range(args.episodes):
-        # Initialize frame stack
-        frame_stack = deque(maxlen=4)
-        episode_reward = 0
-        episode_steps = 0
-        max_floor = 0
-        floors_visited = set()
-        
-        # Reset environment
+    # For video recording
+    if render and video_path and CV2_AVAILABLE:
+        video_frames = []
+    else:
+        video_frames = None
+
+    visualization_enabled = render and CV2_AVAILABLE
+
+    for i in range(episodes):
+        print(f"Starting evaluation episode {i+1}/{episodes}")
         obs = env.reset()
         
-        # Apply seed if specified
-        if args.seed is not None:
-            env.seed(args.seed)
-        
-        # Apply starting floor if specified
-        if args.floor is not None:
-            env.floor(args.floor)
+        # Initialize frame stack with 4 copies of the first observation
+        frame_stack = deque(maxlen=4)
+        if isinstance(obs, tuple):
+            # Handle Obstacle Tower's tuple observation
+            img_obs = obs[0]
+        else:
+            img_obs = obs
             
-        # Process observation
-        obs = np.transpose(obs[0], (2, 0, 1)) / 255.0
+        # Normalize and convert to channels-first format (transpose if needed)
+        img_obs = np.transpose(img_obs, (2, 0, 1)) / 255.0  # Convert to channels-first and normalize
+        
+        # Fill the stack with initial frame
         for _ in range(4):
-            frame_stack.append(obs)
-        state = np.concatenate(frame_stack, axis=0)
-        obs_tensor = torch.tensor(state, dtype=torch.float32).to(device)
+            frame_stack.append(img_obs)
+            
+        # Stack the frames to create input with shape (12, 84, 84)
+        state = np.concatenate(list(frame_stack), axis=0)
         
+        # Convert to torch tensor and move to device
+        state = torch.FloatTensor(state).to(device)
+        if len(state.shape) == 3:
+            state = state.unsqueeze(0)  # Add batch dimension
+            
+        episode_return = 0
+        episode_steps = 0
         done = False
-        
-        # Run episode
-        while not done:
-            # Select action
-            with torch.no_grad():
-                obs_batched = obs_tensor.unsqueeze(0)
-                policy_logits, value = model(obs_batched)
-                
-                # Use more deterministic policy for visualization
-                # Less random for clearer demonstration
-                if np.random.random() < args.deterministic:
-                    action_idx = torch.argmax(policy_logits, dim=1).item()
-                else:
-                    dist = torch.distributions.Categorical(logits=policy_logits)
-                    action_idx = dist.sample().item()
-                
-                action = action_flattener.lookup_action(action_idx)
-                action = np.array(action)
-            
-            # Take step in environment
-            next_obs, reward, done, info = env.step(action)
-            
-            # Handle rendering
-            if args.render:
-                render_img = next_obs[0]
-                
-                # Save frame for video if requested
-                if args.video_path:
-                    if not hasattr(main, 'video_frames'):
-                        main.video_frames = []
-                    main.video_frames.append(render_img.copy())  # Copy to avoid reference issues
-                
-                # Show frame if visualization is enabled
-                if can_visualize:
-                    try:
-                        cv2.imshow('Obstacle Tower', render_img[..., ::-1])  # RGB to BGR for OpenCV
-                        cv2.waitKey(1)
-                    except Exception as e:
-                        print(f"Error displaying frame: {e}")
-                        can_visualize = False  # Disable visualization if it fails
-            
-            # Update statistics
-            current_floor = info["current_floor"]
-            if current_floor > max_floor:
-                max_floor = current_floor
-            floors_visited.add(current_floor)
-            
-            episode_reward += reward
+        current_floor = 0
+
+        # Initialize display window only if rendering is enabled
+        if visualization_enabled:
+            try:
+                cv2.namedWindow('Agent Evaluation', cv2.WINDOW_NORMAL)
+                cv2.resizeWindow('Agent Evaluation', 640, 480)
+            except Exception as e:
+                print(f"Warning: Could not initialize OpenCV window: {e}")
+                visualization_enabled = False
+
+        # Main evaluation loop
+        while not done and episode_steps < max_steps:
             episode_steps += 1
             
-            # Process next observation
-            next_obs = np.transpose(next_obs[0], (2, 0, 1)) / 255.0
-            frame_stack.append(next_obs)
-            next_state = np.concatenate(frame_stack, axis=0)
-            obs_tensor = torch.tensor(next_state, dtype=torch.float32).to(device)
-            
-            # Print progress
-            if episode_steps % 100 == 0 or done:
-                print(f"Episode {episode+1}, Step {episode_steps}, Floor {current_floor}, Reward {episode_reward:.2f}")
+            # Get action from policy
+            with torch.no_grad():
+                policy_logits, value = model(state)
+                action_idx = torch.argmax(policy_logits, dim=1).cpu().numpy()[0]
                 
-            # Optional timeout
-            if args.max_ep_steps and episode_steps >= args.max_ep_steps:
-                print(f"Episode {episode+1} timed out after {episode_steps} steps")
-                break
-        
-        # Record episode results
-        total_rewards.append(episode_reward)
-        max_floors.append(max_floor)
-        episode_floors.append(list(floors_visited))
-        
-        print(f"Episode {episode+1} complete: Reward={episode_reward:.2f}, Max Floor={max_floor}, Steps={episode_steps}")
-    
-    # Print summary
-    avg_reward = sum(total_rewards) / len(total_rewards)
-    avg_floor = sum(max_floors) / len(max_floors)
-    max_floor_overall = max(max_floors)
-    
-    print("\n" + "="*50)
-    print(f"Evaluation Results ({args.episodes} episodes):")
-    print(f"Average Reward: {avg_reward:.2f}")
-    print(f"Average Max Floor: {avg_floor:.2f}")
-    print(f"Maximum Floor Reached: {max_floor_overall}")
-    print("Floor Progression:")
-    for i, floors in enumerate(episode_floors):
-        print(f"  Episode {i+1}: {sorted(floors)}")
-    print("="*50)
-    
-    # Save video if requested
-    if args.render and args.video_path and hasattr(main, 'video_frames') and len(main.video_frames) > 0:
-        try:
-            frames = main.video_frames
-            print(f"Saving video with {len(frames)} frames...")
-            height, width, _ = frames[0].shape
+                # Convert action index to actual action using the flattener
+                action = action_flattener.lookup_action(action_idx)
+                action = np.array(action)
+                
+            # Step environment with selected action
+            obs, reward, done, info = env.step(action)
             
-            # Try to use cv2 if available
-            if CV2_AVAILABLE:
+            if isinstance(obs, tuple):
+                img_obs = obs[0]
+            else:
+                img_obs = obs
+
+            # Track current floor
+            if 'current_floor' in info and info['current_floor'] > current_floor:
+                current_floor = info['current_floor']
+                print(f"Reached floor {current_floor} on episode {i+1}")
+
+            # Render if requested
+            if visualization_enabled:
                 try:
-                    fourcc = cv2.VideoWriter_fourcc(*'mp4v')
-                    video = cv2.VideoWriter(args.video_path, fourcc, 30, (width, height))
-                    
-                    for frame in frames:
-                        video.write(frame[..., ::-1])  # RGB to BGR
+                    # For display - use the raw observation for visualization
+                    display_img = np.array(img_obs).astype(np.uint8)
+                    if display_img.shape[-1] == 1:  # If grayscale, convert to RGB
+                        display_img = np.repeat(display_img, 3, axis=-1)
                         
-                    video.release()
-                    print(f"Video saved to {args.video_path}")
-                except Exception as cv_err:
-                    print(f"Error saving video with OpenCV: {cv_err}")
-                    raise  # Re-raise to try fallback
-            else:
-                raise ImportError("OpenCV not available")
-                
-        except Exception as e:
-            # Fallback to imageio if cv2 fails
-            if IMAGEIO_AVAILABLE:
-                try:
-                    print("Falling back to imageio for video saving...")
-                    imageio.mimsave(args.video_path, frames, fps=30)
-                    print(f"Video saved to {args.video_path} using imageio")
-                except Exception as img_err:
-                    print(f"Error saving video with imageio: {img_err}")
-            else:
-                print(f"Could not save video - both OpenCV and imageio unavailable")
-    
-    # Clean up
-    env.close()
-    if CV2_AVAILABLE:
+                    # Add text with info
+                    if CV2_AVAILABLE:
+                        # Add text with environment information
+                        font = cv2.FONT_HERSHEY_SIMPLEX
+                        cv2.putText(display_img, f"Floor: {info.get('current_floor', 0)}", (10, 20), font, 0.5, (255, 255, 255), 1)
+                        cv2.putText(display_img, f"Keys: {info.get('total_keys', 0)}", (10, 40), font, 0.5, (255, 255, 255), 1)
+                        cv2.putText(display_img, f"Time: {info.get('time_remaining', 0):.1f}", (10, 60), font, 0.5, (255, 255, 255), 1)
+                        cv2.putText(display_img, f"Reward: {episode_return:.1f}", (10, 80), font, 0.5, (255, 255, 255), 1)
+                        
+                        # Show the image
+                        cv2.imshow('Agent Evaluation', display_img[:, :, ::-1])  # Convert RGB to BGR for OpenCV
+                        
+                        # Save for video if requested
+                        if video_path:
+                            video_frames.append(display_img.copy())
+                        
+                        # Handle window events and add delay if in realtime mode
+                        key = cv2.waitKey(1 if realtime_mode else 1)
+                        if key == 27:  # ESC key
+                            print("Evaluation terminated by user")
+                            break
+                except Exception as e:
+                    print(f"Warning: Visualization error: {e}")
+                    visualization_enabled = False  # Disable visualization if it fails
+            
+            # Process the new observation for the model
+            img_obs = np.transpose(img_obs, (2, 0, 1)) / 255.0  # Convert to channels-first and normalize
+            frame_stack.append(img_obs)
+            
+            # Stack the frames to create input with shape (12, 84, 84)
+            next_state = np.concatenate(list(frame_stack), axis=0)
+            
+            # Convert to torch tensor and move to device
+            state = torch.FloatTensor(next_state).to(device)
+            if len(state.shape) == 3:
+                state = state.unsqueeze(0)
+            
+            episode_return += reward
+
+            # For demonstration purpose, print progress every 100 steps
+            if episode_steps % 100 == 0:
+                print(f"Episode {i+1}, Step {episode_steps}, Current Floor: {info.get('current_floor', 0)}, Return: {episode_return:.2f}")
+        
+        # Episode complete
+        returns.append(episode_return)
+        floors_reached.append(current_floor)
+        steps_per_episode.append(episode_steps)
+        print(f"Episode {i+1} complete - Return: {episode_return:.2f}, Floor: {current_floor}, Steps: {episode_steps}")
+
+    # Close OpenCV window if opened
+    if visualization_enabled:
+        cv2.destroyAllWindows()
+
+    # Save video if we've collected frames
+    if render and video_path and video_frames:
         try:
-            cv2.destroyAllWindows()
-        except:
-            pass
+            if CV2_AVAILABLE:
+                print(f"Saving video to {video_path}...")
+                height, width, layers = video_frames[0].shape
+                fourcc = cv2.VideoWriter_fourcc(*'mp4v')
+                video = cv2.VideoWriter(video_path, fourcc, 30, (width, height))
+                
+                for frame in video_frames:
+                    video.write(frame[:, :, ::-1])  # Convert RGB to BGR for OpenCV
+                video.release()
+                print(f"Video saved to {video_path}")
+            elif IMAGEIO_AVAILABLE:
+                print(f"OpenCV video writing failed. Trying imageio as fallback...")
+                imageio.mimsave(video_path, video_frames, fps=30)
+                print(f"Video saved using imageio to {video_path}")
+            else:
+                print(f"Cannot save video - neither OpenCV nor imageio are available")
+        except Exception as e:
+            print(f"Error saving video: {e}")
+
+    # Return evaluation results
+    mean_return = np.mean(returns)
+    mean_floor = np.mean(floors_reached)
+    mean_steps = np.mean(steps_per_episode)
+    
+    results = {
+        'returns': returns,
+        'mean_return': mean_return,
+        'floors_reached': floors_reached,
+        'mean_floor': mean_floor,
+        'steps_per_episode': steps_per_episode,
+        'mean_steps': mean_steps
+    }
+    
+    print(f"Evaluation complete - Mean return: {mean_return:.2f}, Mean floor: {mean_floor:.2f}, Mean steps: {mean_steps:.2f}")
+    return results
+
+def evaluate_main(args=None):
+    """
+    Main evaluation function
+    """
+    if args is None:
+        parser = argparse.ArgumentParser(description='Evaluate a trained ObstacleTower agent')
+        parser.add_argument('--env_path', type=str, default='./ObstacleTower/obstacletower.x86_64', 
+                            help='Path to ObstacleTower executable')
+        parser.add_argument('--seed', type=int, default=0, help='Random seed')
+        parser.add_argument('--floor', type=int, default=None, help='Starting floor')
+        parser.add_argument('--checkpoint', type=str, required=True, help='Path to agent checkpoint')
+        parser.add_argument('--device', type=str, default='cuda' if torch.cuda.is_available() else 'cpu', 
+                            help='Device to use (cuda or cpu)')
+        parser.add_argument('--deterministic', action='store_true', help='Use deterministic actions')
+        parser.add_argument('--episodes', type=int, default=10, help='Number of episodes to evaluate')
+        parser.add_argument('--max_ep_steps', type=int, default=1000, help='Maximum steps per episode')
+        parser.add_argument('--render', action='store_true', help='Render the environment')
+        parser.add_argument('--realtime_mode', action='store_true', help='Run in realtime mode')
+        parser.add_argument('--video_path', type=str, default=None, help='Path to save video of evaluation')
+        args = parser.parse_args()
+
+    print("Starting evaluation with parameters:")
+    for arg in vars(args):
+        print(f"  {arg}: {getattr(args, arg)}")
+
+    # Set device
+    device = torch.device(args.device)
+    print(f"Using device: {device}")
+
+    # Create environment
+    env = create_obstacle_tower_env(
+        executable_path=args.env_path,
+        realtime_mode=args.realtime_mode,
+        timeout=300,
+        no_graphics=not args.render
+    )
+    print(f"Environment created. Action space: {env.action_space}, Observation space: {env.observation_space}")
+
+    # Seed for reproducibility
+    torch.manual_seed(args.seed)
+    np.random.seed(args.seed)
+    if args.seed is not None:
+        env.seed(args.seed)
+    
+    # Set starting floor if specified
+    if args.floor is not None:
+        env.floor(args.floor)
+        print(f"Setting starting floor to {args.floor}")
+
+    # Create action flattener for the MultiDiscrete action space
+    if hasattr(env.action_space, 'n'):
+        action_flattener = None
+        action_dim = env.action_space.n
+    else:
+        action_flattener = ActionFlattener(env.action_space.nvec)
+        action_dim = action_flattener.action_space.n
+    
+    # Create the model with input shape (12, 84, 84) for 4 stacked RGB frames
+    input_shape = (12, 84, 84)  # Fixed shape that the model expects
+    print(f"Using input shape: {input_shape}, Action dimension: {action_dim}")
+    model = PPONetwork(input_shape=input_shape, num_actions=action_dim).to(device)
+    
+    # Load checkpoint
+    if args.checkpoint:
+        print(f"Loading checkpoint from {args.checkpoint}")
+        model, _, _ = load_checkpoint(model, args.checkpoint)
+        model.eval()  # Set to evaluation mode
+    
+    # Run evaluation
+    eval_results = evaluate_agent(
+        env=env,
+        model=model,
+        action_flattener=action_flattener,
+        device=device,
+        episodes=args.episodes,
+        max_steps=args.max_ep_steps,
+        render=args.render,
+        realtime_mode=args.realtime_mode,
+        starting_floor=args.floor,
+        video_path=args.video_path
+    )
+    
+    # Close environment
+    env.close()
+    
+    return eval_results
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description='Evaluate a trained agent on Obstacle Tower')
-    
-    # Environment settings
-    parser.add_argument('--env_path', type=str, default="./ObstacleTower/obstacletower.x86_64",
-                        help='Path to Obstacle Tower executable')
-    parser.add_argument('--seed', type=int, default=None,
-                        help='Random seed for environment (optional)')
-    parser.add_argument('--floor', type=int, default=None,
-                        help='Starting floor (optional)')
-    
-    # Model settings
-    parser.add_argument('--checkpoint', type=str, required=True,
-                        help='Path to checkpoint file')
-    parser.add_argument('--device', type=str, default='cuda' if torch.cuda.is_available() else 'cpu',
-                        help='Device (cuda or cpu)')
-    parser.add_argument('--deterministic', type=float, default=0.9,
-                        help='Probability of choosing the most likely action')
-    
-    # Evaluation settings
-    parser.add_argument('--episodes', type=int, default=5,
-                        help='Number of episodes to run')
-    parser.add_argument('--max_ep_steps', type=int, default=1000,
-                        help='Maximum steps per episode')
-    
-    # Visualization settings
-    parser.add_argument('--render', action='store_true',
-                        help='Render the environment')
-    parser.add_argument('--video_path', type=str, default=None,
-                        help='Path to save video (requires --render)')
-    
-    args = parser.parse_args()
-    
-    main(args) 
+    evaluate_main() 
