@@ -15,58 +15,22 @@ class PositionTrackingWrapper(gym.Wrapper):
         self._position_resolution = 1.0  # Resolution for position discretization
         
     def step(self, action):
-        obs, reward, done, info = self.env.step(action)
+        """
+        Wrapper around env.step that handles both single actions and batched actions from vectorized environments.
+        """
+        # Convert to numpy array if it's not already
+        if not isinstance(action, np.ndarray):
+            action = np.array(action)
         
-        # Add position information to info
-        # These are estimates as the exact position is not directly available
-        # We'll use the visual observation to estimate movement
-        if not hasattr(self, '_prev_frame') or self._prev_frame is None:
-            self._prev_frame = obs[0] if isinstance(obs, tuple) else obs
-            info['x_pos'] = 0
-            info['y_pos'] = 0
-            info['z_pos'] = 0
+        # Handle single action vs batched actions from vectorized environments
+        if len(action.shape) == 1:
+            # Single action - reshape to expected format
+            obs, reward, done, info = self.env.step(action.reshape([1, -1]))
+            return obs, reward, done, info
         else:
-            # Estimate movement from frame difference
-            # This is a simple approach - actual position would require environment access
-            current_frame = obs[0] if isinstance(obs, tuple) else obs
-            frame_diff = np.mean(np.abs(current_frame - self._prev_frame))
-            
-            # If there's significant difference, assume movement
-            if frame_diff > 0.1:
-                # Direction is based on action
-                if isinstance(action, (list, np.ndarray)) and len(action) >= 3:
-                    move_idx, rot_idx = action[0], action[1]
-                    
-                    # Update position estimates based on action
-                    # This is simplified - actual position would be better
-                    if move_idx == 1:  # Forward
-                        info['z_pos'] = info.get('z_pos', 0) + 1
-                    elif move_idx == 2:  # Backward
-                        info['z_pos'] = info.get('z_pos', 0) - 1
-                        
-                    if rot_idx == 1:  # Right rotation
-                        info['x_pos'] = info.get('x_pos', 0) + 0.5
-                    elif rot_idx == 2:  # Left rotation
-                        info['x_pos'] = info.get('x_pos', 0) - 0.5
-            
-            self._prev_frame = current_frame
-            
-            # Track visited positions and add exploration bonus
-            # Discretize position to a grid
-            pos_key = self._get_position_key(info)
-            if pos_key is not None:
-                visit_count = self._visited_positions.get(pos_key, 0)
-                self._visited_positions[pos_key] = visit_count + 1
-                
-                # Add to info for use in reward shaping
-                info['visit_count'] = visit_count
-                
-                # Reset visited positions if floor changes to encourage exploration on new floors
-                if hasattr(self, '_last_floor') and info.get('current_floor', 0) > self._last_floor:
-                    self._visited_positions = {}
-                self._last_floor = info.get('current_floor', 0)
-        
-        return obs, reward, done, info
+            # Batch of actions - reshape each one and step environment
+            obs, reward, done, info = self.env.step(action.reshape([action.shape[0], -1]))
+            return obs, reward, done, info
     
     def _get_position_key(self, info):
         """Create a discrete position key for the current position"""
@@ -99,7 +63,8 @@ def create_obstacle_tower_env(executable_path='./ObstacleTower/obstacletower.x86
                             realtime_mode=False, 
                             timeout=300,
                             no_graphics=True,
-                            config=None):
+                            config=None,
+                            worker_id=None):
     """Create an Obstacle Tower environment with appropriate settings for HPC."""
     # Set environment variables
     os.environ['DISPLAY'] = os.environ.get('DISPLAY', ':1')
@@ -109,7 +74,9 @@ def create_obstacle_tower_env(executable_path='./ObstacleTower/obstacletower.x86
         os.environ['OBSTACLE_TOWER_DISABLE_GRAPHICS'] = '1'
     
     # Create environment with longer timeout
-    worker_id = int(time.time()) % 10000  # Random worker ID
+    if worker_id is None:
+        worker_id = int(time.time()) % 10000  # Random worker ID
+        
     env = ObstacleTowerEnv(
         executable_path,
         retro=False,
