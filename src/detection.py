@@ -14,6 +14,13 @@ def detect_key_visually(observation, previous_observation):
     """
     if previous_observation is None:
         return False
+    
+    # Handle tuple observations (visual_obs, vector_obs)
+    if isinstance(observation, tuple):
+        observation = observation[0]  # Extract visual observation
+    
+    if isinstance(previous_observation, tuple):
+        previous_observation = previous_observation[0]  # Extract visual observation
         
     # Convert to appropriate format if needed
     if observation.shape[-1] == 3:  # Check if color channel is last dimension
@@ -78,6 +85,10 @@ def detect_door_visually(observation):
     Returns:
         bool: Whether a door-like object was detected
     """
+    # Handle tuple observations (visual_obs, vector_obs)
+    if isinstance(observation, tuple):
+        observation = observation[0]  # Extract visual observation
+    
     # Convert to appropriate format if needed
     if observation.shape[-1] == 3:  # Check if color channel is last dimension
         obs = observation.copy()
@@ -186,6 +197,13 @@ def detect_door_opening(previous_obs, current_obs, has_key, previous_has_key):
     # Check for significant changes in the scene that might indicate a door opening
     if previous_obs is None:
         return False
+    
+    # Handle tuple observations (visual_obs, vector_obs)
+    if isinstance(current_obs, tuple):
+        current_obs = current_obs[0]  # Extract visual observation
+    
+    if isinstance(previous_obs, tuple):
+        previous_obs = previous_obs[0]  # Extract visual observation
         
     # Convert to appropriate format
     if current_obs.shape[-1] == 3:

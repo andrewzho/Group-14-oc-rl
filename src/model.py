@@ -138,6 +138,16 @@ class PPONetwork(nn.Module):
         if x.max() > 1.0:
             x = x / 255.0
             
+        # Check for NaN values in input
+        if torch.isnan(x).any():
+            print("WARNING: NaN detected in network input! Replacing with zeros.")
+            x = torch.where(torch.isnan(x), torch.zeros_like(x), x)
+            
+        # Check for infinity values in input
+        if torch.isinf(x).any():
+            print("WARNING: Infinity detected in network input! Replacing with zeros.")
+            x = torch.where(torch.isinf(x), torch.zeros_like(x), x)
+            
         features = self.conv(x)
         
         # Apply advantage stream with layer normalization
@@ -159,6 +169,22 @@ class PPONetwork(nn.Module):
         val_features = self.value_stream[4](val_features)  # ReLU
         val_features = self.value_stream[5](val_features)  # Dropout
         value = self.value_stream[6](val_features)  # Output layer
+        
+        # Check for NaN or Inf values in outputs and replace with safe values
+        if torch.isnan(policy_logits).any() or torch.isinf(policy_logits).any():
+            print("WARNING: NaN or Inf detected in policy logits! Applying emergency fix.")
+            policy_logits = torch.where(torch.isnan(policy_logits) | torch.isinf(policy_logits), 
+                                     torch.zeros_like(policy_logits), policy_logits)
+            # Set a safe default logit distribution (uniform) to avoid crashes
+            policy_logits = torch.ones_like(policy_logits) * 0.01
+        
+        if torch.isnan(value).any() or torch.isinf(value).any():
+            print("WARNING: NaN or Inf detected in value output! Replacing with zeros.")
+            value = torch.where(torch.isnan(value) | torch.isinf(value), 
+                             torch.zeros_like(value), value)
+        
+        # Apply a small clip to policy logits for numerical stability
+        policy_logits = torch.clamp(policy_logits, -20.0, 20.0)
         
         return policy_logits, value
 
