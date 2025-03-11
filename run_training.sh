@@ -17,4 +17,4 @@ export DISPLAY=:1
 # Make sure ObstacleTower executable has correct permissions
 chmod +x ./ObstacleTower/obstacletower.x86_64
 
-python -m src.train.py --log_dir logs_hpc --num_steps 5000000 
+python -m src.train --log_dir logs_hpc --num_steps 5000000 
