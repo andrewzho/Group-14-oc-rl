@@ -12,7 +12,7 @@
 ## to see all available GPUs.
 
 Xvfb $DISPLAY -screen 0 1024x768x24 &
-export DISPLAY=:1
+export DISPLAY=:44
 
 # Make sure ObstacleTower executable has correct permissions
 chmod +x ObstacleTower/obstacletower.x86_64
