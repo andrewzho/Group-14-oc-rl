@@ -99,8 +99,27 @@ class PrioritizedReplayBuffer:
     
     def update_priorities(self, indices, priorities):
         """Update priorities of sampled experiences."""
-        for idx, priority in zip(indices, priorities):
-            self.priorities[idx] = priority
+        # Ensure priorities is an array even if a scalar is passed
+        if np.isscalar(priorities):
+            print(f"WARNING: Scalar priority value received: {priorities}. Converting to array.")
+            priorities = np.full_like(indices, priorities, dtype=np.float32)
+        
+        # Ensure we're working with arrays
+        indices = np.asarray(indices)
+        priorities = np.asarray(priorities)
+        
+        # Make sure lengths match
+        if len(indices) != len(priorities):
+            print(f"ERROR: Length mismatch! Indices: {len(indices)}, Priorities: {len(priorities)}")
+            # Trim or extend priorities to match indices length
+            if len(priorities) > len(indices):
+                priorities = priorities[:len(indices)]
+            else:
+                priorities = np.append(priorities, np.ones(len(indices) - len(priorities)))
+        
+        # Update priorities in the buffer (vectorized operation)
+        # This is faster than a loop for larger batches
+        self.priorities[indices] = priorities
     
     def __len__(self):
         """Return the current size of the buffer."""
@@ -217,9 +236,13 @@ class RainbowDQN:
         # Initialize RND model for intrinsic motivation
         self.rnd_model = RNDModel(state_shape).to(device)
         
-        # Initialize optimizers
-        self.optimizer = optim.Adam(self.policy_net.parameters(), lr=lr)
-        self.rnd_optimizer = optim.Adam(self.rnd_model.predictor.parameters(), lr=rnd_lr)
+        # Initialize optimizers with better parameters
+        self.optimizer = optim.Adam(self.policy_net.parameters(), lr=lr, eps=1.5e-4)
+        self.rnd_optimizer = optim.Adam(self.rnd_model.predictor.parameters(), lr=rnd_lr, eps=1.5e-4)
+        
+        # Add learning rate schedulers for better convergence
+        self.scheduler = optim.lr_scheduler.StepLR(self.optimizer, step_size=100000, gamma=0.5)
+        self.rnd_scheduler = optim.lr_scheduler.StepLR(self.rnd_optimizer, step_size=100000, gamma=0.5)
         
         # Experience replay buffers
         self.memory = PrioritizedReplayBuffer(buffer_size, batch_size, alpha, beta_start, beta_frames)
@@ -275,6 +298,10 @@ class RainbowDQN:
             
             # Normalize intrinsic reward
             intrinsic_reward = self.normalize_reward(intrinsic_reward)
+            
+            # Apply a non-linear scaling to make rare states more valuable
+            # This helps prevent the agent from getting stuck in a loop of novel states
+            intrinsic_reward = np.sqrt(intrinsic_reward) * 3.0
             
             return intrinsic_reward
     
@@ -365,18 +392,35 @@ class RainbowDQN:
         loss = -(target_q_dist * torch.log(current_q_dist + 1e-8)).sum(1)
         
         # Apply importance sampling weights
-        loss = (loss * weights).mean()
+        weighted_loss = (loss * weights).mean()
+        
+        # CRITICAL FIX: Create an array of priorities based on individual losses
+        # Instead of using the mean loss, use the individual losses for each sample
+        individual_losses = loss.detach().cpu().numpy()
+        
+        # Ensure priorities are positive and add a small constant
+        priorities = individual_losses + 1e-8
+        
+        # Double-check that priorities is an array matching the length of indices
+        if len(priorities) != len(indices):
+            print(f"WARNING: Priority length mismatch! Creating array of correct length.")
+            # Fallback: create a uniform array if lengths don't match
+            priorities = np.ones_like(indices, dtype=np.float32) * 1.0
         
         # Update priorities in replay buffer
-        prios = loss.detach().cpu().numpy() + 1e-8  # Small constant to ensure positive priority
-        self.memory.update_priorities(indices, prios)
+        self.memory.update_priorities(indices, priorities)
         
         # Update Rainbow model
         self.optimizer.zero_grad()
-        loss.backward()
+        weighted_loss.backward()
         # Clip gradients to prevent large updates
         torch.nn.utils.clip_grad_norm_(self.policy_net.parameters(), 10)
         self.optimizer.step()
+        
+        # Step the learning rate schedulers periodically
+        if hasattr(self, 'scheduler') and self.steps_done % 1000 == 0:
+            self.scheduler.step()
+            self.rnd_scheduler.step()
         
         # Reset noise for noisy layers
         self.policy_net.reset_noise()
@@ -384,7 +428,7 @@ class RainbowDQN:
         # Learn intrinsic reward predictor
         self.update_rnd(states)
         
-        return loss.item()
+        return weighted_loss.item()
     
     def compute_target_distribution(self, rewards, next_q_dist, dones):
         """Compute target distribution for distributional RL."""

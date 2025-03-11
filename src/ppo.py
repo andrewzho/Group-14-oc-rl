@@ -15,17 +15,19 @@ class PPO:
         epochs=4,
         batch_size=256,  # Increased batch size for more stable updates
         vf_coef=0.5,
-        ent_reg=0.02,  # Start with higher entropy regularization
+        ent_reg=0.03,  # Higher entropy regularization for more exploration
         max_grad_norm=0.5,
         target_kl=0.05,
         lr_scheduler='cosine',
-        adaptive_entropy=True,  # New parameter for adaptive entropy
-        min_entropy=0.005,     # Minimum entropy level
+        adaptive_entropy=True,  # Use adaptive entropy for better exploration
+        min_entropy=0.01,     # Minimum entropy level to maintain exploration
         entropy_decay_factor=0.9999,  # Slow decay for entropy
-        update_adv_batch_norm=True    # Added parameter for advantage batch normalization
+        update_adv_batch_norm=True,   # Added parameter for advantage batch normalization
+        entropy_boost_threshold=0.001, # Threshold for boosting entropy when progress stalls
+        lr_reset_interval=50          # Reset optimizer occasionally to escape plateaus
     ):
         """
-        Proximal Policy Optimization algorithm with adaptive entropy.
+        Proximal Policy Optimization algorithm with adaptive entropy and enhanced exploration.
         
         Args:
             model: Policy network
@@ -44,6 +46,8 @@ class PPO:
             min_entropy: Minimum entropy regularization coefficient
             entropy_decay_factor: Factor to decay entropy by each update
             update_adv_batch_norm: Whether to normalize advantages per batch
+            entropy_boost_threshold: Policy loss threshold for boosting entropy
+            lr_reset_interval: Reset optimizer every N updates to escape plateaus
         """
         self.model = model
         self.lr = lr
@@ -61,6 +65,8 @@ class PPO:
         self.min_entropy = min_entropy
         self.entropy_decay_factor = entropy_decay_factor
         self.update_adv_batch_norm = update_adv_batch_norm
+        self.entropy_boost_threshold = entropy_boost_threshold
+        self.lr_reset_interval = lr_reset_interval
         
         # Adaptive learning rate to break out of plateaus
         self.optimizer = optim.Adam(model.parameters(), lr=lr, eps=1e-5)
@@ -102,6 +108,14 @@ class PPO:
         self.policy_loss_history = []
         self.stagnation_counter = 0
         self.stagnation_threshold = 10  # Number of updates with minimal change to detect stagnation
+        
+        # Update counter for optimizer resets
+        self.update_counter = 0
+        
+        # Exploration tracking
+        self.entropy_history = []
+        self.performance_history = []  # Track rewards or floors reached
+        self.exploration_phase = True  # Start in exploration-focused phase
         
     def compute_gae(self, rewards: List[float], values: List[float], next_value: float, dones: List[bool]) -> List[float]:
         """
@@ -157,7 +171,7 @@ class PPO:
     def update(self, states: List[np.ndarray], actions: List[int], old_log_probs: List[float], 
                returns: List[float], advantages: List[float]) -> Dict[str, float]:
         """
-        Update the model using PPO with enhanced stability features.
+        Update the model using PPO with enhanced exploration features.
         
         Args:
             states: List of states
@@ -169,6 +183,9 @@ class PPO:
         Returns:
             Dictionary of metrics
         """
+        # Increment update counter for tracking
+        self.update_counter += 1
+        
         # Sanity check for valid inputs
         if len(states) == 0 or len(actions) == 0:
             print("Warning: Empty batch in update call")
@@ -183,24 +200,35 @@ class PPO:
                 'entropy_reg': self.ent_reg
             }
         
-        # Check for NaN values in advantages
-        if np.isnan(np.sum(advantages)):
+        # Check for NaN values in advantages - differently depending on type
+        if isinstance(advantages, torch.Tensor):
+            has_nans = torch.isnan(advantages).any().item()
+        else:
+            has_nans = np.isnan(np.sum(advantages))
+            
+        if has_nans:
             print("Warning: NaN detected in advantages, skipping update")
             # Reset advantage values to prevent propagation
-            advantages = [0.0 if np.isnan(adv) else adv for adv in advantages]
+            if isinstance(advantages, torch.Tensor):
+                advantages = torch.where(torch.isnan(advantages), 
+                                        torch.zeros_like(advantages), 
+                                        advantages)
+            else:
+                advantages = [0.0 if np.isnan(adv) else adv for adv in advantages]
         
         # Apply warmup if still in warmup phase
         if self.warmup_steps < self.warmup_total:
             self.warmup_scheduler.step()
             self.warmup_steps += 1
             
-        # Convert to tensors and normalize advantages
-        device = next(self.model.parameters()).device
-        states = torch.FloatTensor(np.array(states)).to(device)
-        actions = torch.LongTensor(actions).to(device)
-        old_log_probs = torch.FloatTensor(old_log_probs).to(device)
-        returns = torch.FloatTensor(returns).to(device)
-        advantages = torch.FloatTensor(advantages).to(device)
+        # Convert to tensors
+        if not isinstance(states, torch.Tensor):
+            device = next(self.model.parameters()).device
+            states = torch.FloatTensor(np.array(states)).to(device)
+            actions = torch.LongTensor(actions).to(device)
+            old_log_probs = torch.FloatTensor(old_log_probs).to(device)
+            returns = torch.FloatTensor(returns).to(device)
+            advantages = torch.FloatTensor(advantages).to(device)
         
         # Normalize advantages for more stable training
         if self.update_adv_batch_norm:
@@ -284,7 +312,7 @@ class PPO:
                 # Calculate clip fraction
                 clip_fraction = torch.mean((torch.abs(ratio - 1) > self.clip_eps).float())
                 
-                # Total loss
+                # Total loss, with dynamic entropy weighting
                 loss = policy_loss + self.vf_coef * value_loss - self.ent_reg * entropy
                 
                 # Optimization step with gradient clipping
@@ -317,25 +345,49 @@ class PPO:
         avg_clip_fraction /= num_epochs
         avg_approx_kl /= num_epochs
         
+        # Store entropy for tracking
+        self.entropy_history.append(avg_entropy)
+        
         # Check for policy stagnation
         self.policy_loss_history.append(avg_policy_loss)
-        if len(self.policy_loss_history) > 10:
+        if len(self.policy_loss_history) > 20:
             self.policy_loss_history.pop(0)
             
-        # Detect stagnation by checking if policy loss is very small
-        if abs(avg_policy_loss) < 0.001:
+        # Detect stagnation by checking if policy loss is very small or not changing
+        if abs(avg_policy_loss) < self.entropy_boost_threshold:
             self.stagnation_counter += 1
         else:
-            self.stagnation_counter = 0
+            self.stagnation_counter = max(0, self.stagnation_counter - 1)  # Decay counter gradually
         
-        # Break out of stagnation by temporarily increasing entropy
+        # Enhanced exploration strategy - boost entropy when progress stalls
         if self.stagnation_counter >= self.stagnation_threshold:
-            print("Policy stagnation detected, increasing entropy regularization")
-            self.ent_reg = min(0.1, self.ent_reg * 3)  # Boost entropy to escape local optimum
-            self.stagnation_counter = 0
+            print(f"Policy stagnation detected (counter={self.stagnation_counter}), boosting entropy")
+            # Significant entropy boost to escape local optima
+            self.ent_reg = min(0.15, self.ent_reg * 3)  
+            self.stagnation_counter = self.stagnation_threshold // 2  # Reduce counter but don't reset
+            
+            # If in extreme stagnation, try a larger boost and learning rate reset
+            if self.stagnation_counter >= self.stagnation_threshold * 2:
+                print("Severe stagnation detected, performing emergency entropy boost and LR reset")
+                self.ent_reg = min(0.3, self.ent_reg * 5)  # Major entropy boost
+                self.reset_optimizer_state()  # Reset optimizer to escape deep local minimum
+                self.stagnation_counter = 0   # Reset counter after taking drastic action
+        
         elif self.adaptive_entropy:
-            # Gradually decay entropy over time, but not below minimum
-            self.ent_reg = max(self.min_entropy, self.ent_reg * self.entropy_decay_factor)
+            # Gradual entropy decay with a floor to maintain exploration
+            if len(self.entropy_history) > 10:
+                # Check if entropy is too low or decreasing too rapidly
+                recent_entropy = np.mean(self.entropy_history[-5:])
+                if recent_entropy < 0.05:  # Very low entropy
+                    # Slightly increase entropy to maintain exploration
+                    self.ent_reg = min(self.initial_ent_reg, self.ent_reg * 1.1)
+                    print(f"Entropy too low ({recent_entropy:.4f}), adjusted to {self.ent_reg:.4f}")
+                else:
+                    # Normal decay
+                    self.ent_reg = max(self.min_entropy, self.ent_reg * self.entropy_decay_factor)
+            else:
+                # Normal decay when not enough history
+                self.ent_reg = max(self.min_entropy, self.ent_reg * self.entropy_decay_factor)
         
         # Calculate explained variance
         with torch.no_grad():
@@ -343,6 +395,10 @@ class PPO:
             value_preds = value_preds.squeeze().cpu().numpy()
             actual_returns = returns.cpu().numpy()
             explained_var = self.calculate_explained_variance(value_preds, actual_returns)
+        
+        # Periodic optimizer reset to escape plateaus
+        if self.lr_reset_interval > 0 and self.update_counter % self.lr_reset_interval == 0:
+            self.reset_optimizer_state()
         
         # Update learning rate if using a scheduler
         if self.scheduler is not None:
@@ -369,7 +425,8 @@ class PPO:
             'approx_kl': avg_approx_kl,
             'explained_variance': explained_var,
             'learning_rate': self.optimizer.param_groups[0]['lr'],
-            'entropy_reg': self.ent_reg
+            'entropy_reg': self.ent_reg,
+            'stagnation_counter': self.stagnation_counter
         }
         
         return metrics
@@ -380,7 +437,7 @@ class PPO:
             self.scheduler.step(reward)
 
     def reset_optimizer_state(self):
-        """Reset optimizer to recover from low learning rates"""
+        """Reset optimizer to recover from low learning rates or plateaus"""
         print(f"Resetting optimizer. Old learning rate: {self.optimizer.param_groups[0]['lr']}")
         self.optimizer = optim.Adam(self.model.parameters(), lr=self.lr, eps=1e-5)
         if self.lr_scheduler == 'cosine':
@@ -388,3 +445,47 @@ class PPO:
                 self.optimizer, T_0=50, T_mult=2, eta_min=self.lr/10
             )
         print(f"Reset optimizer with learning rate: {self.lr}")
+        
+    def set_exploration_mode(self, exploring=True):
+        """
+        Switch between exploration-focused and exploitation-focused modes.
+        
+        Args:
+            exploring: If True, increase entropy for more exploration.
+                      If False, decrease entropy for more exploitation.
+        """
+        self.exploration_phase = exploring
+        
+        if exploring:
+            # Boost entropy for more exploration
+            self.ent_reg = max(self.ent_reg, self.initial_ent_reg * 1.5)
+            print(f"Switched to exploration mode. Entropy reg: {self.ent_reg}")
+        else:
+            # Reduce entropy for more exploitation
+            self.ent_reg = min(self.ent_reg, self.initial_ent_reg * 0.5)
+            print(f"Switched to exploitation mode. Entropy reg: {self.ent_reg}")
+            
+    def update_performance(self, performance_metric):
+        """
+        Update performance tracking for adaptive exploration.
+        
+        Args:
+            performance_metric: Measure of agent performance (reward or floor)
+        """
+        self.performance_history.append(performance_metric)
+        
+        # Keep only recent history
+        if len(self.performance_history) > 10:
+            self.performance_history.pop(0)
+            
+        # Adapt exploration strategy based on recent performance
+        if len(self.performance_history) >= 5:
+            recent_performance = self.performance_history[-5:]
+            # If performance is flat or decreasing, increase exploration
+            if len(set(recent_performance)) <= 2:  # Only 1-2 unique values -> flat performance
+                if not self.exploration_phase:
+                    self.set_exploration_mode(True)
+            # If performance is consistently improving, decrease exploration
+            elif all(recent_performance[i] <= recent_performance[i+1] for i in range(len(recent_performance)-1)):
+                if self.exploration_phase:
+                    self.set_exploration_mode(False)

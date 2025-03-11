@@ -10,6 +10,8 @@ import json
 import gym
 import math
 import random
+from stable_baselines3.common.vec_env import SubprocVecEnv, DummyVecEnv
+from stable_baselines3.common.env_util import make_vec_env
 
 from src.rainbow_dqn import RainbowDQN
 from src.create_env import create_obstacle_tower_env
@@ -88,29 +90,93 @@ def plot_metrics(log_dir, metrics, show=False):
         plt.show()
     plt.close()
 
-def preprocess_frame_stack(obs, frame_stack):
-    """Process observation and add to frame stack."""
-    # For ObstacleTower environment
-    if isinstance(obs, tuple):
-        # Get only the visual observation
-        img_obs = obs[0]
-    else:
-        img_obs = obs
+def preprocess_frame_stack(obs, frame_stacks):
+    """Process observations and add to frame stacks for multiple environments."""
+    batch_size = len(obs)
+    processed_states = []
     
-    # Normalize to [0,1] if needed
-    if img_obs.dtype == np.uint8:
-        img_obs = img_obs.astype(np.float32) / 255.0
+    for i in range(batch_size):
+        # Get observation for this environment
+        env_obs = obs[i]
+        frame_stack = frame_stacks[i]
+        
+        # Process observation
+        if isinstance(env_obs, tuple):
+            img_obs = env_obs[0]
+        else:
+            img_obs = env_obs
+        
+        # Normalize to [0,1] if needed
+        if img_obs.dtype == np.uint8:
+            img_obs = img_obs.astype(np.float32) / 255.0
+        
+        # Convert to channels-first format
+        img_obs = np.transpose(img_obs, (2, 0, 1))
+        
+        # Add to frame stack
+        frame_stack.append(img_obs)
+        
+        # Stack frames
+        state = np.concatenate(list(frame_stack), axis=0)
+        processed_states.append(state)
     
-    # Convert to channels-first format
-    img_obs = np.transpose(img_obs, (2, 0, 1))
+    # Stack all states into a batch
+    return np.array(processed_states)
+
+def shape_reward(reward, info, prev_info=None):
+    """Apply reward shaping to provide denser rewards."""
+    shaped_reward = reward
     
-    # Add to frame stack
-    frame_stack.append(img_obs)
+    # Bonus for moving (based on position change)
+    if prev_info is not None and 'x_pos' in info and 'x_pos' in prev_info:
+        # Calculate distance moved
+        dx = info['x_pos'] - prev_info['x_pos']
+        dz = info.get('z_pos', 0) - prev_info.get('z_pos', 0)
+        dist_moved = np.sqrt(dx**2 + dz**2)
+        
+        # Small bonus for movement to encourage exploration
+        if dist_moved > 0.1:
+            shaped_reward += 0.01
     
-    # Stack frames
-    state = np.concatenate(list(frame_stack), axis=0)
+    # Bonus for exploring new areas
+    if 'visit_count' in info:
+        # Larger bonus for less visited areas
+        visit_count = info['visit_count']
+        if visit_count == 0:  # First visit
+            shaped_reward += 0.05
+        elif visit_count < 3:  # Recently discovered
+            shaped_reward += 0.02
     
-    return state
+    # Bonus for key collection
+    if prev_info is not None and 'total_keys' in info and 'total_keys' in prev_info:
+        if info['total_keys'] > prev_info['total_keys']:
+            shaped_reward += 0.5  # Significant bonus for getting a key
+    
+    # Bonus for door interactions
+    if 'door_found' in info and info['door_found']:
+        shaped_reward += 0.2
+        
+    # Bonus for time efficiency
+    if 'time_remaining' in info and prev_info is not None and 'time_remaining' in prev_info:
+        # Small bonus for efficient use of time
+        if info['time_remaining'] > prev_info['time_remaining']:
+            shaped_reward += 0.01
+    
+    return shaped_reward
+
+def make_env(env_path, seed=None, realtime_mode=False, rank=0):
+    """Factory function to create environments with proper seeding."""
+    def _init():
+        env = create_obstacle_tower_env(
+            executable_path=env_path,
+            realtime_mode=realtime_mode,
+            timeout=300,
+            worker_id=rank  # Use rank for unique worker_id
+        )
+        if seed is not None:
+            env.seed(seed + rank)
+        return env
+    return _init
 
 def train(args):
     """Main training function."""
@@ -135,20 +201,16 @@ def train(args):
     torch.manual_seed(args.seed)
     np.random.seed(args.seed)
     
-    # Create environment
-    print("Creating environment...")
-    env = create_obstacle_tower_env(
-        executable_path=args.env_path,
-        realtime_mode=False,
-        timeout=300
-    )
+    # Create vectorized environments
+    print(f"Creating {args.n_envs} parallel environments...")
+    env_fns = [make_env(args.env_path, args.seed, args.realtime_mode, i) for i in range(args.n_envs)]
     
-    # Seed for reproducibility
-    if args.seed is not None:
-        torch.manual_seed(args.seed)
-        np.random.seed(args.seed)
-        if hasattr(env, 'seed'):
-            env.seed(args.seed)
+    if args.n_envs > 1:
+        # Use SubprocVecEnv for multiple environments (runs in separate processes)
+        env = SubprocVecEnv(env_fns)
+    else:
+        # Use DummyVecEnv for a single environment (simpler, no multiprocessing)
+        env = DummyVecEnv(env_fns)
     
     # Create action flattener for the MultiDiscrete action space
     action_flattener = None
@@ -162,29 +224,31 @@ def train(args):
     state_shape = (12, 84, 84)  # 4 stacked RGB frames, channels first
     print(f"State shape: {state_shape}, Action size: {action_size}")
     
-    # Initialize frame stack
-    frame_stack = deque(maxlen=4)
+    # Initialize frame stacks for each environment
+    frame_stacks = [deque(maxlen=4) for _ in range(args.n_envs)]
     
-    # Get initial observation to determine state shape
+    # Get initial observation
     obs = env.reset()
     
-    # Fill frame stack with initial observation
-    if isinstance(obs, tuple):
-        img_obs = obs[0]
-    else:
-        img_obs = obs
+    # Fill frame stacks with initial observations
+    for i in range(args.n_envs):
+        env_obs = obs[i]
+        if isinstance(env_obs, tuple):
+            img_obs = env_obs[0]
+        else:
+            img_obs = env_obs
+        
+        # Convert to channels-first
+        img_obs = np.transpose(img_obs, (2, 0, 1))
+        
+        for _ in range(4):
+            frame_stacks[i].append(img_obs)
     
-    # Convert to channels-first
-    img_obs = np.transpose(img_obs, (2, 0, 1))
+    # Stack frames to get initial states
+    states = np.array([np.concatenate(list(fs), axis=0) for fs in frame_stacks])
     
-    for _ in range(4):
-        frame_stack.append(img_obs)
-    
-    # Stack frames to get state
-    state = np.concatenate(list(frame_stack), axis=0)
-    
-    # Get state shape
-    state_shape = state.shape
+    # Get state shape from first environment
+    state_shape = states[0].shape
     print(f"State shape: {state_shape}, Action size: {action_size}")
     
     # Create agent
@@ -223,6 +287,13 @@ def train(args):
         'steps_per_second': []
     }
     
+    # For tracking environment episodes
+    env_episodes = [0] * args.n_envs
+    env_rewards = [0] * args.n_envs
+    env_steps = [0] * args.n_envs
+    env_floors = [0] * args.n_envs
+    env_dones = [False] * args.n_envs
+    
     # Training loop
     total_steps = 0
     episode = 0
@@ -232,146 +303,126 @@ def train(args):
     last_checkpoint_time = training_start_time
     last_metrics_time = training_start_time
     
+    # For reward shaping
+    prev_infos = [None] * args.n_envs
+    
     print("Starting training loop...")
     
     try:
         while total_steps < args.num_steps:
-            episode += 1
-            episode_reward = 0
-            episode_steps = 0
-            episode_loss = []
-            episode_intrinsic = []
+            # Select actions for all environments
+            actions = []
+            for i in range(args.n_envs):
+                action = agent.select_action(states[i])
+                actions.append(action)
             
-            # Reset environment
-            obs = env.reset()
-            
-            # Clear frame stack and refill
-            frame_stack.clear()
-            if isinstance(obs, tuple):
-                img_obs = obs[0]
-            else:
-                img_obs = obs
-            
-            img_obs = np.transpose(img_obs, (2, 0, 1))
-            
-            for _ in range(4):
-                frame_stack.append(img_obs)
-            
-            state = np.concatenate(list(frame_stack), axis=0)
-            
-            # Track maximum floor reached
-            max_floor = 0
-            done = False
-            
-            while not done:
-                # Select an action
-                action = agent.select_action(state)
-                
-                # Convert the discrete action to the format expected by the environment
-                # The environment expects a numpy array that can be reshaped
+            # Convert actions to the format expected by the environment
+            action_arrays = []
+            for i, action in enumerate(actions):
                 if isinstance(action, (int, np.int64, np.int32)):
                     if action_flattener is not None:
-                        # Convert the flat action index to the multi-discrete action format
-                        action_array = np.array(action_flattener.lookup_action(action), dtype=np.int32)
+                        # Convert flat action to multi-discrete format
+                        action_array = action_flattener.lookup_action(action)
                     else:
-                        # If no flattener, just convert to a numpy array
-                        action_array = np.array([action], dtype=np.int32)
+                        action_array = [action]
                 else:
                     action_array = action
-                
-                # Step the environment
-                obs, reward, done, info = env.step(action_array)
-                
-                # Process new observation
-                next_state = preprocess_frame_stack(obs, frame_stack)
+                action_arrays.append(action_array)
+            
+            # Step environments
+            next_obs, rewards, dones, infos = env.step(action_arrays)
+            
+            # Process observations and update frame stacks
+            next_states = preprocess_frame_stack(next_obs, frame_stacks)
+            
+            # Apply reward shaping and step agent for each environment
+            for i in range(args.n_envs):
+                # Apply reward shaping if enabled
+                shaped_reward = shape_reward(rewards[i], infos[i], prev_infos[i]) if args.reward_shaping else rewards[i]
+                prev_infos[i] = infos[i].copy() if infos[i] else None
                 
                 # Calculate intrinsic reward
-                intrinsic_reward = agent.calculate_intrinsic_reward(next_state)
-                episode_intrinsic.append(intrinsic_reward)
+                intrinsic_reward = agent.calculate_intrinsic_reward(next_states[i])
                 
-                # Process the step
-                agent.step(state, action, reward, next_state, done)
+                # Step the agent (add to replay buffer)
+                agent.step(states[i], actions[i], shaped_reward, next_states[i], dones[i])
                 
-                # Update state
-                state = next_state
+                # Update episode tracking
+                env_rewards[i] += rewards[i]  # Track original rewards for metrics
+                env_steps[i] += 1
                 
-                # Track episode statistics
-                episode_reward += reward
-                episode_steps += 1
-                total_steps += 1
+                # Track floor level
+                if 'current_floor' in infos[i] and infos[i]['current_floor'] > env_floors[i]:
+                    env_floors[i] = infos[i]['current_floor']
+                    print(f"Env {i} - New floor reached: {env_floors[i]} (Episode {env_episodes[i]+1}, Total steps: {total_steps})")
                 
-                # Track floor
-                if 'current_floor' in info and info['current_floor'] > max_floor:
-                    max_floor = info['current_floor']
-                    print(f"New floor reached: {max_floor} (Episode {episode}, Step {total_steps})")
-                
-                # Learn every few steps
-                if total_steps % args.learn_every == 0 and total_steps > args.learning_starts:
-                    loss = agent.learn()
-                    episode_loss.append(loss)
-                
-                # Render if requested
-                if args.render:
-                    env.render()
-                
-                # Check for episode termination by max length
-                if episode_steps >= args.max_episode_steps:
-                    print(f"Episode terminated after reaching max steps ({args.max_episode_steps})")
-                    done = True
-                
-                # Save checkpoint periodically
-                current_time = time.time()
-                if current_time - last_checkpoint_time > args.checkpoint_interval:
-                    checkpoint_path = os.path.join(args.log_dir, f"rainbow_step_{total_steps}.pth")
-                    agent.save(checkpoint_path)
-                    last_checkpoint_time = current_time
-                
-                # Log metrics periodically
-                if current_time - last_metrics_time > args.metrics_interval:
-                    # Calculate steps per second
-                    steps_per_sec = total_steps / (current_time - training_start_time)
-                    metrics['steps_per_second'].append(steps_per_sec)
+                # Handle episode completion
+                if dones[i]:
+                    episode += 1
                     
-                    # Save metrics
-                    with open(os.path.join(args.log_dir, 'metrics.json'), 'w') as f:
-                        json.dump(to_python_type(metrics), f, indent=4)
+                    # Record metrics for completed episode
+                    metrics['episode_rewards'].append(env_rewards[i])
+                    metrics['episode_lengths'].append(env_steps[i])
+                    metrics['floors_reached'].append(env_floors[i])
                     
-                    # Plot metrics
-                    plot_metrics(args.log_dir, metrics)
+                    # Print episode summary
+                    print(f"Env {i} - Episode {env_episodes[i]+1} - Reward: {env_rewards[i]:.2f}, "
+                          f"Length: {env_steps[i]}, Floor: {env_floors[i]}, Total Steps: {total_steps}")
                     
-                    last_metrics_time = current_time
+                    # Save floor-specific checkpoints
+                    if env_floors[i] > 0:
+                        floor_path = os.path.join(args.log_dir, f"rainbow_floor_{env_floors[i]}.pth")
+                        if not os.path.exists(floor_path):
+                            print(f"Saving checkpoint for floor {env_floors[i]}")
+                            agent.save(floor_path)
                     
-                    print(f"Episode {episode} in progress - Steps: {total_steps}, "
-                          f"Reward: {episode_reward:.2f}, Floor: {max_floor}, "
-                          f"Steps/sec: {steps_per_sec:.2f}")
+                    # Reset episode tracking for this environment
+                    env_episodes[i] += 1
+                    env_rewards[i] = 0
+                    env_steps[i] = 0
+                    env_floors[i] = 0
             
-            # Episode complete
-            metrics['episode_rewards'].append(episode_reward)
-            metrics['episode_lengths'].append(episode_steps)
-            metrics['floors_reached'].append(max_floor)
+            # Update states
+            states = next_states
             
-            if episode_loss:
-                avg_loss = sum(episode_loss) / len(episode_loss)
-                metrics['losses'].append(avg_loss)
+            # Increment step counter
+            total_steps += args.n_envs
             
-            if episode_intrinsic:
-                avg_intrinsic = sum(episode_intrinsic) / len(episode_intrinsic)
-                metrics['intrinsic_rewards'].append(avg_intrinsic)
+            # Learn every few steps
+            if total_steps % args.learn_every == 0 and total_steps > args.learning_starts:
+                loss = agent.learn()
+                if loss > 0:  # Only record non-zero losses
+                    metrics['losses'].append(loss)
             
-            # Print episode summary
-            print(f"Episode {episode} - Reward: {episode_reward:.2f}, Length: {episode_steps}, "
-                  f"Floor: {max_floor}, Total Steps: {total_steps}")
+            # Save checkpoint periodically
+            current_time = time.time()
+            if current_time - last_checkpoint_time > args.checkpoint_interval:
+                checkpoint_path = os.path.join(args.log_dir, f"rainbow_step_{total_steps}.pth")
+                agent.save(checkpoint_path)
+                last_checkpoint_time = current_time
             
-            # Save floor-specific checkpoints
-            if max_floor > 0:
-                floor_path = os.path.join(args.log_dir, f"rainbow_floor_{max_floor}.pth")
-                if not os.path.exists(floor_path):
-                    print(f"Saving checkpoint for floor {max_floor}")
-                    agent.save(floor_path)
+            # Log metrics periodically
+            if current_time - last_metrics_time > args.metrics_interval:
+                # Calculate steps per second
+                steps_per_sec = total_steps / (current_time - training_start_time)
+                metrics['steps_per_second'].append(steps_per_sec)
+                
+                # Save metrics
+                with open(os.path.join(args.log_dir, 'metrics.json'), 'w') as f:
+                    json.dump(to_python_type(metrics), f, indent=4)
+                
+                # Plot metrics
+                plot_metrics(args.log_dir, metrics)
+                
+                last_metrics_time = current_time
+                
+                print(f"Progress - Total Steps: {total_steps}, Episodes: {episode}, "
+                      f"Steps/sec: {steps_per_sec:.2f}")
             
-            # Evaluate periodically
-            if episode % args.eval_interval == 0:
-                evaluate(agent, env, device, args.eval_episodes, args.max_episode_steps, args.render)
+            # Run evaluation periodically
+            if episode > 0 and episode % args.eval_interval == 0:
+                evaluate(agent, create_obstacle_tower_env(args.env_path), device, action_flattener, 
+                         args.eval_episodes, args.max_episode_steps, args.render)
     
     except KeyboardInterrupt:
         print("Training interrupted by user")
@@ -386,28 +437,29 @@ def train(args):
         
         plot_metrics(args.log_dir, metrics, show=False)
         
-        # Close environment
+        # Close environments
         env.close()
         
         print(f"Training complete. Total steps: {total_steps}, Episodes: {episode}")
         print(f"Results saved to {args.log_dir}")
 
-def evaluate(agent, env, device, episodes=5, max_steps=1000, render=False):
+def evaluate(agent, env, device, action_flattener=None, episodes=5, max_steps=1000, render=False):
     """Evaluate the agent's performance."""
     print("\nEvaluating agent...")
     
-    # Initialize frame stack
-    frame_stack = deque(maxlen=4)
+    # Initialize frame stacks
+    frame_stacks = [deque(maxlen=4) for _ in range(episodes)]
     
     returns = []
     floors_reached = []
     
     for i in range(episodes):
-        # Reset environment
+        # Reset environments
         obs = env.reset()
         
-        # Clear frame stack and refill
-        frame_stack.clear()
+        # Clear frame stacks and refill
+        for frame_stack in frame_stacks:
+            frame_stack.clear()
         if isinstance(obs, tuple):
             img_obs = obs[0]
         else:
@@ -416,49 +468,46 @@ def evaluate(agent, env, device, episodes=5, max_steps=1000, render=False):
         img_obs = np.transpose(img_obs, (2, 0, 1))
         
         for _ in range(4):
-            frame_stack.append(img_obs)
+            for frame_stack in frame_stacks:
+                frame_stack.append(img_obs)
         
-        state = np.concatenate(list(frame_stack), axis=0)
+        states = preprocess_frame_stack(obs, frame_stacks)
         
         # Initialize episode metrics
         episode_return = 0
         max_floor = 0
-        done = False
+        done = [False] * episodes
         step = 0
         
-        while not done and step < max_steps:
-            # Select action (deterministically for evaluation)
-            action = agent.select_action(state, evaluate=True)
+        while not all(done) and step < max_steps:
+            # Select actions (deterministically for evaluation)
+            actions = agent.select_action(states, evaluate=True)
             
-            # Convert the discrete action to the format expected by the environment
-            # The environment expects a numpy array that can be reshaped
-            if isinstance(action, (int, np.int64, np.int32)):
-                if action_flattener is not None:
-                    # Convert the flat action index to the multi-discrete action format
-                    action_array = np.array(action_flattener.lookup_action(action), dtype=np.int32)
-                else:
-                    # If no flattener, just convert to a numpy array
-                    action_array = np.array([action], dtype=np.int32)
+            # Convert the discrete actions to the format expected by the environments
+            # The environments expect numpy arrays that can be reshaped
+            if isinstance(actions, (list, tuple)):
+                action_arrays = [np.array(action_flattener.lookup_action(action), dtype=np.int32) for action in actions]
             else:
-                action_array = action
-                
-            # Step environment
-            obs, reward, done, info = env.step(action_array)
+                action_arrays = [np.array([actions], dtype=np.int32)]
             
-            # Process new observation
-            next_state = preprocess_frame_stack(obs, frame_stack)
+            # Step environments
+            obs, rewards, dones, infos = env.step(action_arrays)
             
-            # Update state
-            state = next_state
+            # Process new states
+            next_states = preprocess_frame_stack(obs, frame_stacks)
+            
+            # Update states
+            states = next_states
             
             # Track episode statistics
-            episode_return += reward
+            episode_return += sum(rewards)
             step += 1
             
-            # Track floor
-            if 'current_floor' in info and info['current_floor'] > max_floor:
-                max_floor = info['current_floor']
-                print(f"Evaluation - New floor reached: {max_floor}")
+            # Track floors
+            for j in range(episodes):
+                if 'current_floor' in infos[j] and infos[j]['current_floor'] > max_floor:
+                    max_floor = infos[j]['current_floor']
+                    print(f"Evaluation - New floor reached: {max_floor}")
             
             # Render if requested
             if render:
@@ -490,6 +539,10 @@ def main():
                         help='Path to Obstacle Tower executable')
     parser.add_argument('--seed', type=int, default=42,
                         help='Random seed')
+    parser.add_argument('--n_envs', type=int, default=1,
+                        help='Number of parallel environments')
+    parser.add_argument('--reward_shaping', action='store_true',
+                        help='Enable reward shaping for denser rewards')
     
     # Training settings
     parser.add_argument('--num_steps', type=int, default=2000000,
@@ -516,7 +569,7 @@ def main():
                         help='Learning rate')
     parser.add_argument('--eps_start', type=float, default=1.0,
                         help='Starting epsilon for exploration')
-    parser.add_argument('--eps_end', type=float, default=0.01,
+    parser.add_argument('--eps_end', type=float, default=0.05,
                         help='Final epsilon')
     parser.add_argument('--eps_decay', type=int, default=100000,
                         help='Epsilon decay rate')
@@ -526,7 +579,7 @@ def main():
                         help='Initial beta for importance sampling weights')
     
     # RND settings
-    parser.add_argument('--int_coef', type=float, default=0.5,
+    parser.add_argument('--int_coef', type=float, default=1.0,
                         help='Intrinsic reward coefficient')
     parser.add_argument('--ext_coef', type=float, default=1.0,
                         help='Extrinsic reward coefficient')
