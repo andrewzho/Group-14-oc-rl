@@ -64,7 +64,8 @@ def create_obstacle_tower_env(executable_path='./ObstacleTower/obstacletower.x86
                             timeout=300,
                             no_graphics=True,
                             config=None,
-                            worker_id=None):
+                            worker_id=None,
+                            base_port=5005):
     """Create an Obstacle Tower environment with appropriate settings for HPC."""
     # Set environment variables
     os.environ['DISPLAY'] = os.environ.get('DISPLAY', ':1')
@@ -76,6 +77,13 @@ def create_obstacle_tower_env(executable_path='./ObstacleTower/obstacletower.x86
     # Create environment with longer timeout
     if worker_id is None:
         worker_id = int(time.time()) % 10000  # Random worker ID
+    else:
+        # Use base_port to influence worker_id, but don't pass it directly
+        # This ensures each process gets a unique port
+        # Convert to worker_id range (0-100 are often used by default)
+        worker_offset = (base_port - 5005) // 10
+        if worker_offset > 0:
+            worker_id = worker_id + worker_offset
         
     env = ObstacleTowerEnv(
         executable_path,

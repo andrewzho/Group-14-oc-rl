@@ -244,15 +244,59 @@ class MetricsTracker:
             
     def update_from_ppo(self, ppo):
         """Update metrics from a PPO object"""
-        self.metrics['policy_losses'] = ppo.policy_losses
-        self.metrics['value_losses'] = ppo.value_losses
-        self.metrics['entropy_values'] = ppo.entropy_values
-        self.metrics['clip_fractions'] = ppo.clip_fractions
-        self.metrics['approx_kl_divs'] = ppo.approx_kl_divs
+        # Use getattr with default values to avoid AttributeError if attributes don't exist
+        if hasattr(ppo, 'policy_losses'):
+            self.metrics['policy_losses'] = ppo.policy_losses
+        elif hasattr(ppo, 'policy_loss'):
+            # If there's a single value instead of a list
+            if 'policy_losses' not in self.metrics:
+                self.metrics['policy_losses'] = []
+            self.metrics['policy_losses'].append(ppo.policy_loss)
+            
+        if hasattr(ppo, 'value_losses'):
+            self.metrics['value_losses'] = ppo.value_losses
+        elif hasattr(ppo, 'value_loss'):
+            # If there's a single value instead of a list
+            if 'value_losses' not in self.metrics:
+                self.metrics['value_losses'] = []
+            self.metrics['value_losses'].append(ppo.value_loss)
+            
+        if hasattr(ppo, 'entropy_values'):
+            self.metrics['entropy_values'] = ppo.entropy_values
+        elif hasattr(ppo, 'entropy'):
+            # If there's a single value instead of a list
+            if 'entropy_values' not in self.metrics:
+                self.metrics['entropy_values'] = []
+            self.metrics['entropy_values'].append(ppo.entropy)
+            
+        if hasattr(ppo, 'clip_fractions'):
+            self.metrics['clip_fractions'] = ppo.clip_fractions
+        
+        if hasattr(ppo, 'approx_kl_divs'):
+            self.metrics['approx_kl_divs'] = ppo.approx_kl_divs
+        elif hasattr(ppo, 'approx_kl'):
+            if 'approx_kl_divs' not in self.metrics:
+                self.metrics['approx_kl_divs'] = []
+            self.metrics['approx_kl_divs'].append(ppo.approx_kl)
+        elif hasattr(ppo, 'kl_divergence'):
+            if 'approx_kl_divs' not in self.metrics:
+                self.metrics['approx_kl_divs'] = []
+            self.metrics['approx_kl_divs'].append(ppo.kl_divergence)
+            
         if hasattr(ppo, 'explained_variances'):
             self.metrics['explained_variances'] = ppo.explained_variances
+        elif hasattr(ppo, 'explained_variance'):
+            if 'explained_variances' not in self.metrics:
+                self.metrics['explained_variances'] = []
+            self.metrics['explained_variances'].append(ppo.explained_variance)
+            
         if hasattr(ppo, 'learning_rates'):
             self.metrics['learning_rates'] = ppo.learning_rates
+        elif hasattr(ppo, 'optimizer') and hasattr(ppo.optimizer, 'param_groups'):
+            # Extract current learning rate from optimizer
+            if 'learning_rates' not in self.metrics:
+                self.metrics['learning_rates'] = []
+            self.metrics['learning_rates'].append(ppo.optimizer.param_groups[0]['lr'])
             
     def save(self, plot=True):
         """Save metrics to disk"""

@@ -3,6 +3,15 @@ import torch.nn as nn
 import torch.nn.functional as F
 import numpy as np
 import math  # Add import for math functions
+import os
+
+# Add global debug flag that respects verbosity setting
+DEBUG_MODE = os.environ.get('DEBUG', '0') == '1'
+
+def debug_print(*args, **kwargs):
+    """Print only when debug mode is enabled."""
+    if DEBUG_MODE:
+        print(*args, **kwargs)
 
 class ICMFeatureEncoder(nn.Module):
     """
@@ -184,7 +193,7 @@ class ICM(nn.Module):
                 results = self.forward(state, next_state, action)
                 return results['intrinsic_reward']
         except Exception as e:
-            print(f"Warning: Error computing intrinsic reward: {e}")
+            debug_print(f"Warning: Error computing intrinsic reward: {e}")
             # Return zero reward on error to avoid breaking training
             if isinstance(state, torch.Tensor):
                 return torch.zeros(state.size(0), device=state.device)
@@ -200,7 +209,7 @@ class ICM(nn.Module):
             
             # Check for NaN or Inf values
             if math.isnan(batch_mean) or math.isinf(batch_mean) or math.isnan(batch_var) or math.isinf(batch_var):
-                print("Warning: NaN or Inf detected in reward statistics, skipping update")
+                debug_print("Warning: NaN or Inf detected in reward statistics, skipping update")
                 return
             
             # Update running statistics using Welford's online algorithm
@@ -214,14 +223,14 @@ class ICM(nn.Module):
             
             self.count += batch_count
         except Exception as e:
-            print(f"Warning: Error updating reward normalization: {e}")
+            debug_print(f"Warning: Error updating reward normalization: {e}")
     
     def _normalize_reward(self, reward, clip=5.0):
         """Normalize rewards using running statistics."""
         try:
             # Check for NaN values
             if torch.isnan(reward).any():
-                print("Warning: NaN rewards detected, replacing with zeros")
+                debug_print("Warning: NaN rewards detected, replacing with zeros")
                 reward = torch.where(torch.isnan(reward), torch.zeros_like(reward), reward)
             
             # Avoid division by zero or negative variance
@@ -235,7 +244,7 @@ class ICM(nn.Module):
             # Scale the rewards to a reasonable range
             return normalized * self.reward_scale
         except Exception as e:
-            print(f"Warning: Error normalizing reward: {e}")
+            debug_print(f"Warning: Error normalizing reward: {e}")
             # Return zero reward on error to avoid breaking training
             return torch.zeros_like(reward)
     
