@@ -1,8 +1,16 @@
+# Import the numpy patch first to fix np.bool deprecation
+from src.np_patch import *
+
 import gym
 from obstacle_tower_env import ObstacleTowerEnv
+import warnings
+# Filter out the spammy gym_unity warnings
+warnings.filterwarnings("ignore", category=UserWarning, module="gym_unity")
+
 from src.model import PPONetwork, RecurrentPPONetwork
 from src.ppo import PPO
 from src.utils import normalize, save_checkpoint, load_checkpoint, ActionFlattener, MetricsTracker, TrainingLogger
+import torch.nn.functional as F
 import torch
 import numpy as np
 import argparse
@@ -23,6 +31,97 @@ import matplotlib.pyplot as plt
 from matplotlib.figure import Figure
 import matplotlib
 matplotlib.use('Agg')  # Use non-interactive backend for headless operation
+import cv2
+
+# New imports for TensorBoard
+from torch.utils.tensorboard import SummaryWriter
+
+# TensorBoard Logger
+class TensorboardLogger:
+    def __init__(self, log_dir):
+        self.writer = SummaryWriter(log_dir)
+        self.step_count = 0
+        self.episode_count = 0
+        
+    def log_scalar(self, tag, value, step=None):
+        """Log a scalar value to TensorBoard"""
+        if step is None:
+            step = self.step_count
+        self.writer.add_scalar(tag, value, step)
+    
+    def log_episode(self, reward, length, floor, max_floor, step_count=None):
+        """Log episode metrics to TensorBoard"""
+        if step_count is not None:
+            self.step_count = step_count
+        else:
+            self.step_count += length
+            
+        self.episode_count += 1
+        self.writer.add_scalar('episode/reward', reward, self.episode_count)
+        self.writer.add_scalar('episode/length', length, self.episode_count)
+        self.writer.add_scalar('episode/floor', floor, self.episode_count)
+        self.writer.add_scalar('episode/max_floor', max_floor, self.episode_count)
+        
+    def log_update(self, metrics):
+        """Log policy update metrics to TensorBoard"""
+        for key, value in metrics.items():
+            self.writer.add_scalar(f'update/{key}', value, self.step_count)
+            
+    def log_image(self, tag, image, step=None):
+        """Log an image to TensorBoard"""
+        if step is None:
+            step = self.step_count
+            
+        # Convert image to proper format if needed
+        if isinstance(image, np.ndarray):
+            if image.dtype == np.float32 and image.max() <= 1.0:
+                image = (image * 255).astype(np.uint8)
+                
+            if len(image.shape) == 3 and image.shape[0] == 3:  # CHW format
+                image = np.transpose(image, (1, 2, 0))
+                
+            self.writer.add_image(tag, image, step, dataformats='HWC')
+        
+    def log_video(self, tag, frames, fps=30, step=None):
+        """Log a video to TensorBoard"""
+        if step is None:
+            step = self.step_count
+            
+        # Convert frames to proper format
+        video_frames = []
+        for frame in frames:
+            if isinstance(frame, np.ndarray):
+                if frame.dtype == np.float32 and frame.max() <= 1.0:
+                    frame = (frame * 255).astype(np.uint8)
+                    
+                if len(frame.shape) == 3 and frame.shape[0] == 3:  # CHW format
+                    frame = np.transpose(frame, (1, 2, 0))
+                    
+                video_frames.append(frame)
+            
+        # Convert to correct tensor format for TensorBoard
+        if video_frames:
+            video_tensor = np.stack(video_frames)
+            self.writer.add_video(tag, video_tensor[None], step, fps=fps)
+        
+    def log_hyperparams(self, hyperparams):
+        """Log hyperparameters"""
+        # Convert hyperparams to proper format for TensorBoard
+        hparam_dict = {}
+        metric_dict = {}
+        
+        for key, value in hyperparams.items():
+            if isinstance(value, (int, float, str, bool)):
+                hparam_dict[key] = value
+            else:
+                # For non-primitive types, convert to string
+                hparam_dict[key] = str(value)
+        
+        self.writer.add_hparams(hparam_dict, metric_dict)
+        
+    def close(self):
+        """Close the TensorBoard writer"""
+        self.writer.close()
 
 # Add a simple episodic memory mechanism
 class EpisodicMemory:
@@ -71,48 +170,35 @@ class EpisodicMemory:
 
 # Add a new logging system that minimizes console output
 class EnhancedLogger:
-    """
-    Enhanced logging system that minimizes console output while keeping
-    detailed logs in files that can be analyzed later.
-    """
+    """Enhanced logger with visualization capabilities."""
+    
     def __init__(self, log_dir, console_level='INFO', file_level='DEBUG', 
                  console_freq=100, visualize_freq=1000, 
                  verbosity=1, log_intrinsic_rewards=False, intrinsic_log_freq=500):
-        """
-        Initialize enhanced logger.
-    
-    Args:
-            log_dir: Directory to save logs and visualizations
-            console_level: Minimum level to print to console
-            file_level: Minimum level to write to log file
-            console_freq: Controls visualization frequency, episode results are always printed
-            visualize_freq: Generate visualizations every N episodes
-            verbosity: Control amount of debug console output (0=minimal, 1=normal, 2=verbose)
-                       Note: Episode results are ALWAYS printed regardless of this setting
-            log_intrinsic_rewards: Whether to log intrinsic rewards to console
-            intrinsic_log_freq: Only log intrinsic rewards every N steps
-        """
+        """Initialize logger with visualization capabilities."""
         self.log_dir = log_dir
-        os.makedirs(log_dir, exist_ok=True)
-        
-        # Create a timestamp for this run
-        self.timestamp = datetime.datetime.now().strftime('%Y%m%d_%H%M%S')
-        self.log_file = os.path.join(log_dir, f"training_{self.timestamp}.log")
-        self.metrics_file = os.path.join(log_dir, f"metrics_{self.timestamp}.json")
-        
-        # Configure logging levels
         self.console_level = console_level
         self.file_level = file_level
-        
-        # Configure frequency
         self.console_freq = console_freq
         self.visualize_freq = visualize_freq
-        
-        # Configure verbosity
-        self.verbosity = verbosity
+        self.verbosity = verbosity  # Store verbosity level
         self.log_intrinsic_rewards = log_intrinsic_rewards
         self.intrinsic_log_freq = intrinsic_log_freq
-        self.step_counter = 0
+        self.step_counter = 0  # Add step counter initialization
+        
+        # Create subdirectories
+        self.metrics_dir = os.path.join(log_dir, 'metrics')
+        self.figures_dir = os.path.join(log_dir, 'figures')
+        self.checkpoints_dir = os.path.join(log_dir, 'checkpoints')
+        
+        os.makedirs(self.metrics_dir, exist_ok=True)
+        os.makedirs(self.figures_dir, exist_ok=True)
+        os.makedirs(self.checkpoints_dir, exist_ok=True)
+        
+        # Setup logging
+        self.timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+        self.log_file = os.path.join(log_dir, f'training_{self.timestamp}.log')
+        self.metrics_file = os.path.join(log_dir, f"metrics_{self.timestamp}.json")
         
         # Initialize metrics
         self.metrics = {
@@ -136,7 +222,7 @@ class EnhancedLogger:
         # Set up file logger
         self._setup_file_logger()
         
-        # Log header to console
+        # Print header to console
         print(f"=== OBSTACLE TOWER TRAINING ===")
         print(f"Logs and metrics saved to: {log_dir}")
         print(f"Timestamp: {self.timestamp}")
@@ -195,7 +281,7 @@ class EnhancedLogger:
         self.metrics['lengths'].append(int(length))
         self.metrics['floors'].append(int(floor))
         self.metrics['max_floor'] = max(self.metrics['max_floor'], int(max_floor))
-        self.metrics['total_steps'] = int(steps)
+        self.metrics['total_steps'] = int(steps)  # Make sure we update the total_steps in metrics
         self.metrics['steps_per_second'].append(float(steps_per_sec))
         self.metrics['floors_by_time'].append((int(steps), int(max_floor)))
         
@@ -253,7 +339,6 @@ class EnhancedLogger:
         logger.info(f"[{event_type}] {message}")
         
         # Control console output based on event type and verbosity 
-        # Only print to console if appropriate based on verbosity and event type
         if event_type in ['NEW_FLOOR', 'MILESTONE', 'ACHIEVEMENT']:
             # Always print important achievements
             if self.verbosity >= 0:  # Print at all verbosity levels
@@ -264,7 +349,7 @@ class EnhancedLogger:
             if self.log_intrinsic_rewards and self.step_counter % self.intrinsic_log_freq == 0:
                 if self.verbosity > 1:  # Only with high verbosity
                     print(f"🧠 {message}")
-        elif event_type in ['DOOR', 'KEY', 'KEY_COLLECTED'] and self.verbosity > 0:
+        elif event_type in ['DOOR', 'KEY', 'KEY_COLLECTED'] and self.verbosity > 1:
             # Medium priority events
             print(f"🔑 {event_type}: {message}")
         elif event_type == 'ENV_INTERACTION':
@@ -356,7 +441,7 @@ class EnhancedLogger:
         
         # Save figure
         plt.tight_layout()
-        vis_path = os.path.join(self.log_dir, f"training_vis_{self.timestamp}.png")
+        vis_path = os.path.join(self.figures_dir, f"training_vis_{self.timestamp}.png")
         plt.savefig(vis_path)
         plt.close()
     
@@ -364,6 +449,35 @@ class EnhancedLogger:
         """Save metrics to a JSON file for later analysis."""
         with open(self.metrics_file, 'w') as f:
             json.dump(self.metrics, f, indent=2)
+    
+    def debug(self, message):
+        """Log debug message only at high verbosity."""
+        if self.verbosity > 1:
+            logger = logging.getLogger('obstacle_tower')
+            logger.debug(message)
+            if self.verbosity > 1:  # Only print to console at highest verbosity
+                print(f"DEBUG: {message}")
+    
+    def info(self, message):
+        """Log info message with medium verbosity."""
+        logger = logging.getLogger('obstacle_tower')
+        logger.info(message)
+        if self.verbosity > 0:  # Print at normal and high verbosity
+            print(f"INFO: {message}")
+    
+    def warning(self, message):
+        """Log warning message."""
+        logger = logging.getLogger('obstacle_tower')
+        logger.warning(message)
+        # Always print warnings
+        print(f"⚠️ WARNING: {message}")
+    
+    def error(self, message):
+        """Log error message."""
+        logger = logging.getLogger('obstacle_tower')
+        logger.error(message)
+        # Always print errors
+        print(f"❌ ERROR: {message}")
     
     def close(self):
         """Generate final visualizations and save metrics."""
@@ -380,28 +494,129 @@ class EnhancedLogger:
         print(f"Metrics saved to: {self.metrics_file}")
         print("=========================\n")
 
-# Add a debug flag to control print statements
-DEBUG_MODE = os.environ.get('DEBUG', '0') == '1'  # Set DEBUG=1 in environment to enable debug output
+# Replace debug_print with a function that uses the logger
+def debug_print(logger, *args, **kwargs):
+    """Only print if verbosity level is high enough."""
+    if logger and logger.verbosity > 1:
+        message = " ".join(map(str, args))
+        logger.debug(message)
 
-def debug_print(*args, **kwargs):
-    """Print only when debug mode is enabled."""
-    if DEBUG_MODE:
-        print(*args, **kwargs)
+# Simplified reward shaping function
+def shape_reward(reward, info, action, prev_info=None, prev_keys=None, episodic_memory=None, current_floor=0):
+    """Apply simplified reward shaping"""
+    shaped_reward = reward
+    
+    # Basic structure for tracking reward components
+    reward_components = {
+        'base': reward,
+        'floor_bonus': 0,
+        'key_bonus': 0,
+        'door_bonus': 0,
+        'exploration_bonus': 0,
+        'movement_bonus': 0
+    }
+    
+    # 1. Floor completion bonus - the most important signal
+    info_floor = info.get("current_floor", 0)
+    if prev_info and info_floor > prev_info.get("current_floor", 0):
+        floor_bonus = 5.0  # Significant bonus for reaching a new floor
+        shaped_reward += floor_bonus
+        reward_components['floor_bonus'] = floor_bonus
+    
+    # 2. Key collection bonus
+    current_keys = info.get("total_keys", 0)
+    if prev_keys is not None and current_keys > prev_keys:
+        key_bonus = 1.0  # Substantial bonus for collecting keys
+        shaped_reward += key_bonus
+        reward_components['key_bonus'] = key_bonus
+        
+        # Track key location in memory
+        if episodic_memory:
+            position = (info.get("x_pos", 0), info.get("y_pos", 0), info.get("z_pos", 0))
+            episodic_memory.add_key_location(current_floor, position)
+    
+    # 3. Door opening bonus (key usage)
+    if prev_keys is not None and current_keys < prev_keys:
+        door_bonus = 2.0  # Significant bonus for using keys effectively
+        shaped_reward += door_bonus
+        reward_components['door_bonus'] = door_bonus
+        
+        # Track door location in memory
+        if episodic_memory:
+            position = (info.get("x_pos", 0), info.get("y_pos", 0), info.get("z_pos", 0))
+            episodic_memory.add_door_location(current_floor, position)
+    
+    # 4. Simple exploration bonus - avoid revisits
+    if 'visit_count' in info:
+        visit_count = info['visit_count']
+        if visit_count == 0:  # First visit to this state
+            exploration_bonus = 0.1
+            shaped_reward += exploration_bonus
+            reward_components['exploration_bonus'] = exploration_bonus
+    
+    # 5. Basic movement bonuses
+    # Extract movement from action
+    if isinstance(action, (list, tuple, np.ndarray)) and len(action) >= 3:
+        move_idx, rot_idx, jump_idx = action[0], action[1], action[2]
+        
+        # Reward forward movement
+        if move_idx == 1:  # Forward
+            movement_bonus = 0.002  # Small positive reward
+            shaped_reward += movement_bonus
+            reward_components['movement_bonus'] = movement_bonus
+    
+    return shaped_reward, reward_components
+
+def record_eval_video(model, env, device, action_flattener, max_steps=500, use_lstm=False):
+    """Record a video of the agent's performance"""
+    frames = []
+    obs = env.reset()
+    done = False
+    steps = 0
+    
+    # Initialize frame stack
+    frame_stack = deque(maxlen=4)
+    obs = np.transpose(obs[0], (2, 0, 1)) / 255.0
+    for _ in range(4):
+        frame_stack.append(obs)
+    state = np.concatenate(frame_stack, axis=0)
+    
+    # Initialize LSTM state if needed
+    lstm_state = None
+    if use_lstm and hasattr(model, 'init_lstm_state'):
+        lstm_state = model.init_lstm_state(batch_size=1, device=device)
+    
+    while not done and steps < max_steps:
+        # Capture frame
+        frame = env.render(mode='rgb_array')
+        frames.append(frame)
+        
+        # Get action from policy
+        with torch.no_grad():
+            state_tensor = torch.FloatTensor(state).unsqueeze(0).to(device)
+            if use_lstm:
+                policy_logits, _, lstm_state = model(state_tensor, lstm_state)
+            else:
+                policy_logits, _ = model(state_tensor)
+            
+            action_idx = torch.argmax(policy_logits, dim=1).cpu().numpy()[0]
+            action = action_flattener.lookup_action(action_idx)
+            
+        # Step environment
+        next_obs, reward, done, info = env.step(action)
+        
+        # Update state
+        next_obs = np.transpose(next_obs[0], (2, 0, 1)) / 255.0
+        frame_stack.append(next_obs)
+        state = np.concatenate(frame_stack, axis=0)
+        
+        steps += 1
+    
+    return frames
 
 def main(args):
     """Main training function."""
-    global DEBUG_MODE
     
-    # Set debug mode based on verbosity
-    DEBUG_MODE = args.verbosity >= 2  # Only enable debug prints if verbosity is at least 2
-    
-    # Set environment variable for other modules
-    os.environ['DEBUG'] = '1' if DEBUG_MODE else '0'
-    
-    # Suppress TensorFlow warnings if low verbosity
-    if args.verbosity < 2:
-        os.environ['TF_CPP_MIN_LOG_LEVEL'] = '2'  # Suppress TensorFlow warnings
-        
     # Create log directory
     timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
     log_dir = os.path.join(args.log_dir, f"run_{timestamp}")
@@ -410,17 +625,22 @@ def main(args):
     # Setup logger
     logger = EnhancedLogger(
         log_dir=log_dir,
-        console_freq=args.console_log_freq,
+        console_freq=1 if args.verbosity >= 1 else args.console_log_freq,  # Always show episodes at verbosity 1+
         visualize_freq=args.visualize_freq,
         verbosity=args.verbosity,
-        log_intrinsic_rewards=args.use_icm
+        log_intrinsic_rewards=args.use_icm and args.verbosity >= 2  # Only log intrinsic rewards at verbosity 2+
     )
     
-    # Log start message according to verbosity
-    if args.verbosity >= 1:
-        print(f"Starting training with verbosity={args.verbosity}")
-        print(f"Debug mode {'enabled' if DEBUG_MODE else 'disabled'}")
-        print(f"Logs will be saved to {log_dir}")
+    # Setup TensorBoard logger
+    tb_logger = TensorboardLogger(os.path.join(log_dir, 'tensorboard'))
+    
+    # Set environment variables for other modules
+    os.environ['DEBUG'] = '1' if args.verbosity >= 2 else '0'
+    os.environ['VERBOSITY'] = str(args.verbosity)  # Add this line to set VERBOSITY env var
+    
+    # Suppress TensorFlow warnings if low verbosity
+    if args.verbosity < 2:
+        os.environ['TF_CPP_MIN_LOG_LEVEL'] = '2'  # Suppress TensorFlow warnings
     
     # Set random seeds
     torch.manual_seed(args.seed)
@@ -429,17 +649,25 @@ def main(args):
     
     # Set device for PyTorch
     device = torch.device(args.device)
-    print(f"Using device: {device}")
+    logger.log_event("SETUP", f"Using device: {device}")
     
     # Create environment
-    env = create_obstacle_tower_env(
-        executable_path=args.env_path,
-        realtime_mode=False,
-        timeout=300
-    )
-    
-    # Seed environment for reproducibility
-    env.seed(args.seed)
+    try:
+        env = create_obstacle_tower_env(
+            executable_path=args.env_path,
+            realtime_mode=args.realtime_mode,
+            timeout=300,
+            no_graphics=not args.graphics,  # Flip the graphics flag since our arg is positive but function takes negative
+            config=None,
+            worker_id=None
+        )
+        
+        # Seed environment for reproducibility
+        env.seed(args.seed)
+        logger.log_event("SETUP", "Environment created successfully")
+    except Exception as e:
+        logger.error(f"Failed to create environment: {e}")
+        return
     
     # Create ActionFlattener for MultiDiscrete action space
     if hasattr(env.action_space, 'n'):
@@ -449,7 +677,7 @@ def main(args):
         action_flattener = ActionFlattener(env.action_space.nvec)
         action_dim = action_flattener.action_space.n
     
-    print(f"Action space: {env.action_space}, Action dimension: {action_dim}")
+    logger.log_event("SETUP", f"Action space: {env.action_space}, Action dimension: {action_dim}")
     
     # Create PPO network - updated to support LSTM-based policies
     input_shape = (12, 84, 84)  # 4 stacked RGB frames (4 * 3 channels)
@@ -463,51 +691,65 @@ def main(args):
             lstm_hidden_size=args.lstm_hidden_size,
             use_lstm=True
         ).to(device)
-        print(f"Created recurrent model with LSTM hidden size {args.lstm_hidden_size}")
+        logger.log_event("SETUP", f"Created recurrent model with LSTM hidden size {args.lstm_hidden_size}")
     else:
         # Use standard model without LSTM
         model = PPONetwork(input_shape=input_shape, num_actions=action_dim).to(device)
+        logger.log_event("SETUP", f"Created standard model with input shape {input_shape}")
     
-    print(f"Created model with input shape {input_shape} and {action_dim} actions")
-    
-    # Initialize PPO agent with updated parameters for LSTM if needed
+    # Initialize PPO agent with updated parameters
     ppo_agent = PPO(
         model=model,
-        lr=args.lr,
-        clip_eps=args.clip_eps,
-        gamma=args.gamma,
-        gae_lambda=args.gae_lambda,
-        epochs=args.epochs,
-        batch_size=args.batch_size,
-        vf_coef=args.vf_coef,
-        ent_reg=0.03,                # Increased entropy regularization for better exploration
+        lr=args.lr if hasattr(args, 'lr') and args.lr is not None else 1e-4,  # Reduced learning rate for stability
+        clip_eps=args.clip_eps if hasattr(args, 'clip_eps') and args.clip_eps is not None else 0.2,
+        gamma=args.gamma if hasattr(args, 'gamma') and args.gamma is not None else 0.99,
+        gae_lambda=args.gae_lambda if hasattr(args, 'gae_lambda') and args.gae_lambda is not None else 0.95,
+        epochs=args.epochs if hasattr(args, 'epochs') and args.epochs is not None else 4,
+        batch_size=args.batch_size if hasattr(args, 'batch_size') and args.batch_size is not None else 256,  # Larger batch size
+        vf_coef=args.vf_coef if hasattr(args, 'vf_coef') and args.vf_coef is not None else 0.5,
+        ent_reg=0.01,                 # More conservative entropy regularization
         max_grad_norm=0.5,           
-        target_kl=0.05,              
+        target_kl=0.025,              # Reduced target KL for more conservative updates
         lr_scheduler='linear',       
         adaptive_entropy=True,       
-        min_entropy=0.02,            # Higher minimum entropy to ensure exploration
-        entropy_decay_factor=0.9995, # Slower entropy decay
+        min_entropy=0.005,            # Higher minimum entropy to ensure exploration
+        entropy_decay_factor=0.9999,  # Slower entropy decay
         update_adv_batch_norm=True,  
         entropy_boost_threshold=0.001,
-        lr_reset_interval=50,        
+        lr_reset_interval=100,        # More frequent optimizer resets
         use_icm=args.use_icm,        
-        icm_lr=1e-4,                 
-        icm_reward_scale=0.02,       # Higher ICM reward scale to encourage exploration
+        icm_lr=5e-5,                  # Lower ICM learning rate
+        icm_reward_scale=0.01,        # Reduced ICM reward scale for better balance
         icm_forward_weight=0.2,
         icm_inverse_weight=0.8,
         icm_feature_dim=256,
         device=device,
         use_recurrent=args.use_lstm,
-        recurrent_seq_len=args.sequence_length,
+        recurrent_seq_len=args.sequence_length if hasattr(args, 'sequence_length') and args.sequence_length is not None else 16,  # Longer sequences
     )
+    
+    # Log hyperparameters to TensorBoard
+    hyperparams = {
+        'lr': ppo_agent.lr,
+        'gamma': ppo_agent.gamma,
+        'gae_lambda': ppo_agent.gae_lambda,
+        'clip_eps': ppo_agent.clip_eps,
+        'epochs': ppo_agent.epochs,
+        'batch_size': ppo_agent.batch_size,
+        'ent_reg': ppo_agent.ent_reg,
+        'use_lstm': args.use_lstm,
+        'use_icm': args.use_icm,
+        'seed': args.seed,
+    }
+    tb_logger.log_hyperparams(hyperparams)
     
     # Initialize ICM if enabled
     if args.use_icm:
-        print("Initializing Intrinsic Curiosity Module (ICM)")
+        logger.log_event("SETUP", "Initializing Intrinsic Curiosity Module (ICM)")
         # We need to initialize ICM with 12 channels (4 stacked frames) input shape
         icm_input_shape = (12, 84, 84)  # Modified to use 12 channels
         ppo_agent.initialize_icm(icm_input_shape, action_dim)
-        print(f"ICM initialized with input shape {icm_input_shape} and action dimension {action_dim}")
+        logger.log_event("SETUP", f"ICM initialized with input shape {icm_input_shape} and action dimension {action_dim}")
     
     # For backward compatibility, keep the old metric tracker but we'll primarily use enhanced_logger
     metrics_tracker = MetricsTracker(args.log_dir)
@@ -518,7 +760,7 @@ def main(args):
             model, optimizer_state, scheduler_state, saved_metrics, update_count = load_checkpoint(
                 model, args.checkpoint, ppo_agent.optimizer, ppo_agent.scheduler
             )
-            print(f"Loaded checkpoint from {args.checkpoint}")
+            logger.log_event("CHECKPOINT", f"Loaded checkpoint from {args.checkpoint}")
             # Update optimizer and scheduler if states were loaded
             if optimizer_state:
                 ppo_agent.optimizer.load_state_dict(optimizer_state)
@@ -526,7 +768,7 @@ def main(args):
                 ppo_agent.scheduler.load_state_dict(scheduler_state)
             optimization_steps = update_count if update_count else 0
         except Exception as e:
-            print(f"Error loading checkpoint: {e}")
+            logger.error(f"Error loading checkpoint: {e}")
             optimization_steps = 0
     else:
         optimization_steps = 0
@@ -535,18 +777,15 @@ def main(args):
     last_position = None
     episode_floor_reached = 0
     episode_keys = 0
-    movement_bonus = 0
-    floor_bonus = 0
-    key_bonus = 0
-    door_bonus = 0
-    proximity_bonus = 0
     
     # Initialize key/door memory
     if args.reward_shaping:
         if 'EnhancedKeyDoorMemory' in globals():
-            key_locations = EnhancedKeyDoorMemory()
+            key_door_memory = EnhancedKeyDoorMemory()
         else:
-            key_locations = EpisodicMemory()
+            key_door_memory = EpisodicMemory()
+    else:
+        key_door_memory = None
     
     # For storing episode rewards
     episode_rewards = []
@@ -558,9 +797,6 @@ def main(args):
     best_reward = float('-inf')
     max_floor_reached = 0
     steps_without_progress = 0
-    
-    # Create memory system for keys and doors
-    memory = EnhancedKeyDoorMemory()
     
     # Create episodic memory for tracking key and door locations
     episodic_memory = EpisodicMemory()
@@ -587,6 +823,7 @@ def main(args):
         
         logger.log_event("CURRICULUM", f"Curriculum learning enabled with initial config: {curriculum_config}")
 
+    # Add debugging info at the beginning of the main training loop
     # Main training loop
     start_time = time.time()
     steps_done = 0
@@ -595,6 +832,57 @@ def main(args):
     max_floor_reached = 0
     last_log_time = start_time
     last_save_time = start_time
+    total_steps = 0  # Initialize total step counter ONCE, before defining report_progress
+    
+    # Initialize episode variables
+    truncated_episodes = 0  # Keep track of episodes that were cut off
+    max_episode_steps = 4000  # Maximum steps per episode to prevent getting stuck
+    
+    logger.log_event("TRAINING", f"Starting training loop with {args.num_steps} target steps")
+    
+    # Update the progress reporting to include debug info
+    def report_progress():
+        """Helper function to report current training progress."""
+        nonlocal total_steps, steps_done  # Explicitly tell Python to use the outer scope's variables
+        
+        elapsed = time.time() - start_time
+        fps = total_steps / max(1.0, elapsed)  # Avoid division by zero
+        
+        # Also check and report if steps_done and total_steps are different
+        if steps_done != total_steps:
+            logger.warning(f"Counter mismatch: steps_done={steps_done}, total_steps={total_steps}")
+            # Fix the discrepancy (using max to ensure we don't lose progress)
+            total_steps = max(steps_done, total_steps)
+        
+        # Add detailed step debugging for metrics
+        logger.debug(
+            f"Detailed metrics - episode_count: {episode_count}, "
+            f"steps_done: {steps_done}, total_steps: {total_steps}, "
+            f"max_floor: {max_floor_reached}"
+        )
+        
+        # Build a detailed progress message
+        if total_steps == 0:
+            message = (
+                f"Starting training - environment initialized\n"
+                f"Total episodes: {episode_count}\n"
+                f"Ready to begin collecting experience\n"
+                f"Total setup time: {elapsed:.2f} seconds"
+            )
+        else:
+            message = (
+                f"Training progress at {elapsed:.2f} seconds:\n"
+                f"Total episodes: {episode_count}\n"
+                f"Total steps: {total_steps} (steps_done: {steps_done})\n"
+                f"Max floor reached: {max_floor_reached}\n" 
+                f"Total training time: {elapsed:.2f} seconds\n"
+                f"Average steps per second: {fps:.2f}"
+            )
+            
+        logger.log_event("TRAINING_SUMMARY", message)
+    
+    # Log initial state
+    report_progress()
     
     # Initialize replay buffer
     replay_buffer = {
@@ -608,9 +896,6 @@ def main(args):
     }
     max_replay_size = args.replay_buffer_size
     
-    # Map memory to key_door_memory for consistent naming
-    key_door_memory = memory
-    
     key_collections = 0
     door_openings = 0
     
@@ -620,6 +905,12 @@ def main(args):
     
     # LSTM state handling
     lstm_states = None
+    
+    # Setup metrics tracker - use the correct directory attribute
+    metrics = MetricsTracker(log_dir=os.path.join(logger.log_dir, 'metrics'))
+    
+    # Store previous info for reward shaping
+    prev_info = None
     
     while steps_done < args.num_steps:
         states, actions, rewards, log_probs, values, dones = [], [], [], [], [], []
@@ -632,7 +923,7 @@ def main(args):
             try:
                 # Update curriculum difficulty based on performance
                 # Only update after an episode has completed (not at the very start)
-                if episode_count > 0 and 'done' in locals() and done:  # Check if 'done' exists and is True
+                if episode_count > 0 and 'done' in locals() and done:
                     curriculum_attempts += 1
                     
                     # Track floor-specific success rate
@@ -658,6 +949,15 @@ def main(args):
                         
                         # Make curriculum advancement more generous
                         # If success rate is good or we have a success streak, increase difficulty
+                        if optimization_steps == 5:
+                            logger.log_event("DIAGNOSTIC", "Testing policy after initial updates")
+                            with torch.no_grad():
+                                # Sample a few actions and print probabilities
+                                test_state = torch.FloatTensor(state).unsqueeze(0).to(device)
+                                policy_logits, _ = model(test_state)
+                                probs = F.softmax(policy_logits, dim=1)
+                                logger.log_event("DIAGNOSTIC", f"Action probs: {probs.cpu().numpy()}")
+
                         if (success_rate > 0.5 and curriculum_floor_success_history[floor_reached]['attempts'] >= 3) or \
                            (curriculum_success_streak >= 2):
                             if curriculum_config['max_floor'] < 10:  # Cap at floor 10 for now
@@ -738,6 +1038,9 @@ def main(args):
         env._previous_keys = None
         env._previous_position = None
         
+        # Reset previous info
+        prev_info = None
+        
         # Reset LSTM state at the beginning of each episode if using recurrent policy
         if args.use_lstm:
             ppo_agent.reset_lstm_state()
@@ -745,23 +1048,52 @@ def main(args):
         # Collect trajectory
         steps_this_episode = 0
         trajectory_length = 1024  # Shorter trajectory length for more frequent updates
-        max_episode_steps = 4000  # Set a maximum number of steps per episode to prevent getting stuck
         
         # Track reward components for detailed logging
         reward_components = {
             'base': 0,
-            'forward_movement': 0,
-            'stay_still_penalty': 0,
-            'rotation_penalty': 0,
-            'jump_penalty': 0,
-            'time_penalty': 0,
             'floor_bonus': 0,
             'key_bonus': 0,
             'door_bonus': 0,
-            'exploration_bonus': 0
+            'exploration_bonus': 0,
+            'movement_bonus': 0,
         }
         
         for step in range(trajectory_length):
+            # Check if we've reached the maximum allowed steps for this episode
+            if steps_this_episode >= max_episode_steps:
+                logger.log_event("EPISODE", f"Episode truncated after reaching {max_episode_steps} steps")
+                truncated_episodes += 1
+                # Important: need to log the episode before setting done=True
+                
+                # Log the truncated episode just like we would a completed one
+                episode_count += 1
+                logger.debug(f"Episode {episode_count} truncated after {steps_this_episode} steps")
+                
+                # Log episode completion even though it was truncated
+                logger.log_episode(
+                    episode=episode_count,
+                    reward=episode_reward,
+                    length=episode_length,
+                    floor=current_floor,
+                    max_floor=max_floor_reached,
+                    steps=total_steps,
+                    steps_per_sec=total_steps / (time.time() - start_time)
+                )
+                
+                # Log to TensorBoard
+                tb_logger.log_episode(
+                    reward=episode_reward,
+                    length=episode_length,
+                    floor=current_floor,
+                    max_floor=max_floor_reached,
+                    step_count=total_steps
+                )
+                
+                # Now mark as done to exit the loop
+                done = True
+                break
+                
             with torch.no_grad():
                 # Use PPO agent's select_action method which handles LSTM states
                 action_idx, log_prob, value, _ = ppo_agent.select_action(state)
@@ -783,15 +1115,10 @@ def main(args):
                 info.get("z_pos", 0)
             ]
             
-            # Update position tracking in environment wrapper
-            if not hasattr(env, '_previous_position'):
-                env._previous_position = [0, 0, 0]
-            else:
-                env._previous_position = current_position.copy()
-            
             # Track highest floor reached
-            if info["current_floor"] > current_floor:
-                current_floor = info["current_floor"]
+            info_floor = info.get("current_floor", 0)
+            if info_floor > current_floor:
+                current_floor = info_floor
                 if current_floor > max_floor_reached:
                     max_floor_reached = current_floor
                     floor_msg = f"New floor reached: {current_floor}"
@@ -799,7 +1126,7 @@ def main(args):
                     
                     # Add direct floor checkpoint saving here
                     try:
-                        floor_checkpoint_path = os.path.join(args.log_dir, f"floor_{current_floor}.pth")
+                        floor_checkpoint_path = os.path.join(log_dir, f"floor_{current_floor}.pth")
                         save_checkpoint(
                             model, 
                             floor_checkpoint_path,
@@ -815,367 +1142,47 @@ def main(args):
                         logger.log_event("ERROR", f"ERROR saving floor checkpoint: {e}")
                         traceback.print_exc()
             
-            # Enhanced reward shaping
-            move_idx, rot_idx, jump_idx, _ = action
-            shaped_reward = reward
-            reward_components['base'] += reward
+            # Apply simplified reward shaping
+            current_keys = info.get("total_keys", 0)
+            previous_keys = env._previous_keys if hasattr(env, '_previous_keys') else None
             
-            # Track key usage and door opening
-            current_keys = info["total_keys"]
-            if hasattr(env, '_previous_keys') and env._previous_keys is not None:
-                # If keys decreased without collecting new ones, a door was opened
-                if current_keys < env._previous_keys:
-                    door_bonus = 0.5  # Increased reward for door opening
-                    shaped_reward += door_bonus
-                    door_msg = f"Door opened! Reward bonus added: +{door_bonus}"
-                    logger.log_event("DOOR", door_msg)
-                    door_openings += 1
-                    metrics_tracker.update('door_openings', door_openings)
-                    reward_components['door_bonus'] += door_bonus
-                    
-                    # Record door location in episodic memory
-                    episodic_memory.add_door_location(
-                        info["current_floor"], 
-                        (info.get("x_pos", 0), info.get("y_pos", 0), info.get("z_pos", 0))
-                    )
-                    
-                # If keys increased, a key was collected
-                elif current_keys > env._previous_keys:
-                    key_bonus = 0.5  # Increased reward for key collection
-                    shaped_reward += key_bonus
-                    key_msg = f"Key collected! Reward bonus added: +{key_bonus}"
-                    logger.log_event("KEY", key_msg)
-                    key_collections += 1
-                    metrics_tracker.update('key_collections', key_collections)
-                    reward_components['key_bonus'] += key_bonus
-                    
-                    # Record key location in episodic memory
-                    episodic_memory.add_key_location(
-                        info["current_floor"], 
-                        (info.get("x_pos", 0), info.get("y_pos", 0), info.get("z_pos", 0))
-                    )
+            # Create shaped rewards using the new simplified function
+            shaped_reward, reward_comps = shape_reward(
+                reward, 
+                info, 
+                action, 
+                prev_info=prev_info, 
+                prev_keys=previous_keys, 
+                episodic_memory=episodic_memory,
+                current_floor=current_floor
+            )
+            
+            # Store previous info for next step
+            prev_info = info.copy()
+            
+            # Update reward components tracking
+            for key, value in reward_comps.items():
+                if key in reward_components:
+                    reward_components[key] += value
+            
+            # Track door openings and key collections for metrics
+            if previous_keys is not None and current_keys > previous_keys:
+                key_collections += 1
+                logger.track_item_collection('key')
+            
+            if previous_keys is not None and current_keys < previous_keys:
+                door_openings += 1
+                logger.track_item_collection('door')
+            
+            # Update key count tracker for next step
             env._previous_keys = current_keys
             
-            # Use episodic memory to provide hints to the agent
-            current_position = (info.get("x_pos", 0), info.get("y_pos", 0), info.get("z_pos", 0))
-            
-            # Enhanced door proximity detection and reward
-            has_detected_door = False
-            
-            # Visual door detection - check if a door is visible in the observation
-            if detect_door_visually(next_obs[0]):
-                has_detected_door = True
-                door_visual_bonus = 0.1
-                shaped_reward += door_visual_bonus
-                
-                if current_keys > 0:  # Additional bonus if agent has keys and sees a door
-                    shaped_reward += 0.2
-                    # Replace direct print with logging call
-                    logger.log_event("DOOR", f"Door visually detected with key! Bonus added: +0.3")
-                else:
-                    # Replace direct print with logging call
-                    logger.log_event("DOOR", f"Door visually detected! Bonus added: +0.1") 
-                
-                # Record potential door location
-                door_position = current_position
-                key_door_memory.add_door_location(current_floor, door_position)
-            
-            # If agent has a key and is near a door location, give a progressive hint based on proximity
-            if current_keys > 0:  
-                # Check for doors in memory
-                closest_door_distance = float('inf')
-                for door_floor, door_positions in key_door_memory.door_locations.items():
-                    if door_floor == current_floor:
-                        for door_pos in door_positions:
-                            dist = sum((current_position[i] - door_pos[i])**2 for i in range(3))**0.5
-                            closest_door_distance = min(closest_door_distance, dist)
-                
-                # Progressive reward based on proximity to doors when agent has keys
-                if closest_door_distance < float('inf'):
-                    # Higher reward the closer we get
-                    if closest_door_distance < 1.0:
-                        proximity_bonus = 0.3
-                    elif closest_door_distance < 2.0:
-                        proximity_bonus = 0.2
-                    elif closest_door_distance < 4.0:
-                        proximity_bonus = 0.1
-                    elif closest_door_distance < 8.0:
-                        proximity_bonus = 0.05
-                    else:
-                        proximity_bonus = 0.01
-                        
-                    shaped_reward += proximity_bonus
-                    reward_components['door_bonus'] += proximity_bonus
-                
-            # Encourage forward movement but with less extreme reward
-            if move_idx == 1:  # Forward movement
-                forward_bonus = 0.005  # Reduced from 0.01
-                shaped_reward += forward_bonus
-                reward_components['forward_movement'] += forward_bonus
-            # Small penalty for staying still
-            elif move_idx == 0:
-                stay_penalty = -0.001  # Kept small
-                shaped_reward += stay_penalty
-                reward_components['stay_still_penalty'] += stay_penalty
-                
-            # MUCH smaller penalty for rotation - important for navigation
-            if rot_idx != 0:
-                rot_penalty = -0.0001  # Reduced from -0.0005
-                shaped_reward += rot_penalty
-                reward_components['rotation_penalty'] += rot_penalty
-                
-            # MUCH smaller penalty for jumping - critical for obstacle tower
-            if jump_idx == 1:
-                # Only penalize jumping if it's not being used to navigate
-                # Check if there was significant movement after jump
-                if hasattr(env, '_previous_position') and env._previous_position is not None:
-                    distance = sum((current_position[i] - env._previous_position[i])**2 for i in range(3))**0.5
-                    if distance < 0.1:  # If no significant movement after jump
-                        jump_penalty = -0.0001  # Greatly reduced from -0.005
-                        shaped_reward += jump_penalty
-                
-            # Time penalty to encourage faster completion
-            time_penalty = -0.0001
-            shaped_reward += time_penalty
-            reward_components['time_penalty'] += time_penalty
-            
-            # Enhanced exploration bonus based on visit count, with better scaling
-            visit_count = info.get("visit_count", 0)
-            current_floor = info.get("current_floor", 0)
-            
-            # Calculate adaptive exploration factors
-            # 1. Base exploration factor starts high and decays over training, but maintains a minimum value
-            progress = min(1.0, steps_done / (0.8 * args.num_steps))  # Slower decay over 80% of training
-            base_exploration_factor = max(0.3, 1.0 - progress)  # Decay from 1.0 to 0.3
-            
-            # 2. Floor-specific factor - higher floors get higher exploration bonuses
-            floor_factor = 1.0 + 0.2 * current_floor  # Each floor increases exploration bonus by 20%
-            
-            # 3. Uncertainty factor - areas visited less get higher bonuses
-            if visit_count is not None:
-                if visit_count == 0:  # Never visited before
-                    uncertainty = 1.0  # Maximum uncertainty
-                elif visit_count < 3:  # Visited only a few times
-                    uncertainty = 0.7  # High uncertainty
-                elif visit_count < 10:  # Visited several times
-                    uncertainty = 0.4  # Medium uncertainty
-                else:  # Visited many times
-                    uncertainty = 0.2  # Low uncertainty
-                
-                # Calculate final exploration bonus with all factors
-                exploration_bonus = 0.1 * base_exploration_factor * floor_factor * uncertainty
-                
-                if exploration_bonus > 0:
-                    shaped_reward += exploration_bonus
-                    reward_components['exploration_bonus'] += exploration_bonus
-                    
-                    # Log significant exploration bonuses
-                    if exploration_bonus > 0.05 and steps_done % 100 == 0:
-                        logger.log_event(
-                            "EXPLORATION",
-                            f"Exploration bonus: +{exploration_bonus:.3f} " +
-                            f"(floor: {current_floor}, visits: {visit_count})"
-                        )
-            
-            # Enhance movement reward with directional bias toward unexplored areas
-            if hasattr(env, '_previous_position') and env._previous_position is not None:
-                # Calculate distance moved
-                distance = sum((current_position[i] - env._previous_position[i])**2 for i in range(3))**0.5
-                
-                # Store movement history for temporal persistence
-                if not hasattr(env, '_movement_history'):
-                    env._movement_history = deque(maxlen=10)  # Track last 10 movements
-                
-                # Get current movement direction
-                if distance > 0.1:  # Only consider significant movements
-                    direction = [(current_position[i] - env._previous_position[i])/max(distance, 0.001) for i in range(3)]
-                    env._movement_history.append((direction, current_position.copy(), shaped_reward > 0))
-                
-                # Higher reward for significant movement
-                if distance > 0.5:
-                    # Check if agent is moving toward unexplored areas
-                    target_info = key_door_memory.get_directions_to_target(
-                        current_position, current_floor, current_keys > 0
-                    )
-                    
-                    # Initialize directional bonus
-                    directional_bonus = 0.0
-                    
-                    # Calculate persistence bonus for maintaining direction
-                    persistence_bonus = 0.0
-                    if len(env._movement_history) >= 3:
-                        # Get average direction over past few steps
-                        past_dirs = [env._movement_history[-i-1][0] for i in range(min(3, len(env._movement_history)-1))]
-                        avg_past_dir = [sum(d[i] for d in past_dirs)/len(past_dirs) for i in range(3)]
-                        
-                        # Dot product with current direction
-                        persistence_dot = sum(direction[i] * avg_past_dir[i] for i in range(3))
-                        
-                        # Reward for consistent movement
-                        if persistence_dot > 0.7:  # Roughly the same direction
-                            persistence_bonus = 0.01 * distance * floor_factor
-                        
-                    # Calculate target-seeking bonus
-                    target_bonus = 0.0
-                    if target_info:
-                        # Calculate dot product to see if agent is moving toward target
-                        target_dir = target_info['direction']
-                        dot_product = sum(direction[i] * target_dir[i] for i in range(min(len(direction), len(target_dir))))
-                        
-                        # Higher reward for moving toward targets
-                        if dot_product > 0:
-                            # Scale by how aligned the movement is with target direction
-                            alignment_factor = (dot_product + 1) / 2  # Scale from 0-1
-                            target_bonus = 0.03 * distance * alignment_factor * floor_factor
-                            
-                            # Extra bonus if agent has keys and is moving toward doors
-                            if current_keys > 0 and target_info['type'] == 'door':
-                                target_bonus *= 1.5  # 50% more reward for door-seeking with keys
-                    else:
-                        # Basic movement bonus when no targets known
-                        target_bonus = 0.015 * distance * floor_factor
-                        
-                    # Total directional bonus combines persistence and target-seeking
-                    directional_bonus = persistence_bonus + target_bonus
-                    
-                    if directional_bonus > 0:
-                        shaped_reward += directional_bonus
-                        reward_components['exploration_bonus'] += directional_bonus
-                
-                # Penalize going in circles or backtracking
-                if hasattr(env, '_visited_positions'):
-                    position_key = f"{current_floor}_{round(current_position[0], 1)}_{round(current_position[2], 1)}"
-                    
-                    if position_key in env._visited_positions:
-                        revisit_count = env._visited_positions[position_key]
-                        
-                        # Progressive penalty for revisiting the same location repeatedly
-                        if revisit_count > 5:
-                            loop_penalty = -0.001 * min(revisit_count, 10)  # Cap penalty
-                            shaped_reward += loop_penalty
-                else:
-                    env._visited_positions = {}
-            
-            # Store current position for next step comparison
-            env._previous_position = current_position
-                
-            # Enhanced floor completion bonus with progressive scaling
-            if info["current_floor"] > current_floor:
-                # Progressive floor bonus - higher floors get bigger rewards
-                base_floor_bonus = 5.0  # Increased from 2.0 to 5.0 for stronger signal
-                floor_progression = info["current_floor"] - current_floor
-                floor_bonus = base_floor_bonus * (1 + 0.5 * floor_progression)  # +50% per floor skipped
-                
-                # Add a significant one-time bonus for reaching a new max floor
-                if info["current_floor"] > max_floor_reached:
-                    new_floor_achievement_bonus = 10.0  # Major reward for reaching new floors
-                    shaped_reward += new_floor_achievement_bonus
-                    # Replace direct print with logging call
-                    logger.log_event("NEW_ACHIEVEMENT", f"First time reaching floor {info['current_floor']}! +{new_floor_achievement_bonus} bonus!")
-                
-                shaped_reward += floor_bonus
-                episodic_memory.mark_floor_complete(current_floor)
-                key_door_memory.mark_floor_complete(current_floor)
-                
-                # Track floor achievement
-                new_floor = info["current_floor"]
-                if new_floor > max_floor_reached:
-                    max_floor_reached = new_floor
-                    metrics_tracker.update('max_floor_reached', max_floor_reached)
-                    
-                    # Additional milestone bonus for reaching a new max floor
-                    if new_floor > current_floor + 1:  # Skip multiple floors
-                        milestone_bonus = 15.0  # Substantial bonus for significant progress (increased from 5.0)
-                        shaped_reward += milestone_bonus
-                        # Replace direct print with logging call
-                        logger.log_event("MILESTONE", f"Milestone achieved! Reached new max floor {new_floor}! +{milestone_bonus} bonus")
-                        logger.log_event("NEW_MAX_FLOOR", 
-                            f"Reached new maximum floor {new_floor} (skipped {new_floor - current_floor - 1} floors)"
-                        )
-                    else:
-                        # Replace direct print with logging call
-                        logger.log_event("NEW_MAX_FLOOR", f"Reached new max floor {new_floor}!")
-                        logger.log_event("NEW_MAX_FLOOR", 
-                            f"Reached new maximum floor {new_floor}"
-                        )
-                
-                # Update current floor to the new floor
-                current_floor = new_floor
-                reward_components['floor_bonus'] += floor_bonus
-                # Replace direct print with logging call
-                logger.log_event("FLOOR", f"New floor reached: {current_floor}! Bonus reward added: +{floor_bonus}")
-                
-                # Reset exploration tracking for new floor
-                if hasattr(env, '_visited_positions'):
-                    env._visited_positions = {}
-                    # Replace direct print with logging call
-                    logger.log_event("EXPLORATION", "Reset exploration tracking for new floor")
-                
-                # Also reset movement history for new floor
-                if hasattr(env, '_movement_history'):
-                    env._movement_history.clear()
-                
-                # Add extra hint reward if we have keys to indicate they might be needed
-                if info["total_keys"] > 0:
-                    key_usage_hint = 2.0  # Increased from 1.0 for stronger signal
-                    shaped_reward += key_usage_hint
-                    
-                # Log the significant achievement
-                logger.log_event(
-                    "FLOOR_COMPLETE", 
-                    f"Completed floor {current_floor-1}, moving to floor {current_floor}"
-                )
-            
-            # Log detailed environment interaction if verbose
-            if steps_done % 100 == 0:
-                logger.log_event(
-                    "ENV_INTERACTION",
-                    f"Action: {action}, Reward: {reward}, Shaped Reward: {shaped_reward}"
-                )
-
-            # Store previous observation for detection
-            if hasattr(env, '_previous_obs'):
-                previous_obs = env._previous_obs
-            else:
-                previous_obs = None
-            env._previous_obs = next_obs[0]  # Assuming this is the visual observation
-
-            # Check for key detection
-            key_detected = detect_key_visually(next_obs[0], previous_obs)
-            if key_detected:
-                # Extra visual reward - increased from 2.0 to 3.0
-                key_visual_bonus = 3.0
-                shaped_reward += key_visual_bonus
-                # Replace direct print with logging call
-                logger.log_event("KEY", f"Key visually detected! +{key_visual_bonus} reward")
-                
-                # Update memory with current position
-                current_position = (info.get("x_pos", 0), info.get("y_pos", 0), info.get("z_pos", 0))
-                key_door_memory.add_key_location(info["current_floor"], current_position)
-                # Track key collection for metrics
-                key_collections += 1
-                metrics_tracker.update('key_collections', key_collections)
-                logger.log_event("KEY", f"Key detected at floor {info['current_floor']}, position {current_position}")
-
-            # Check for key collection by comparing with previous state
-            has_key = info["total_keys"] > 0
-            if hasattr(env, '_previous_keys') and env._previous_keys is not None:
-                if has_key and env._previous_keys == 0:
-                    # Additional reward for actually collecting the key
-                    key_collection_bonus = 4.0
-                    shaped_reward += key_collection_bonus
-                    # Replace direct print with logging call
-                    logger.log_event("KEY_COLLECTED", f"Key collected! +{key_collection_bonus} reward")
-                    logger.log_event("KEY_COLLECTED", f"Key collected at floor {info['current_floor']}")
-            # Update the key count tracker
-            env._previous_keys = info["total_keys"]
-
             # Apply intrinsic motivation if ICM is enabled
             if args.use_icm and ppo_agent.icm is not None:
                 # Convert observation to tensor for ICM
-                if previous_obs is not None:
+                if prev_obs is not None:
                     # Process current and next observation using frame stacking
-                    state_tensor = preprocess_observation_for_icm(previous_obs, frame_stack).to(device)
+                    state_tensor = preprocess_observation_for_icm(prev_obs, frame_stack).to(device)
                     next_state_tensor = preprocess_observation_for_icm(next_obs, frame_stack).to(device)
                     
                     # Add batch dimension if needed
@@ -1221,6 +1228,11 @@ def main(args):
             episode_length += 1
             steps_done += 1
             steps_this_episode += 1
+            total_steps += 1
+            
+            # Log step counting every 1000 steps for debugging
+            if total_steps % 1000 == 0:
+                logger.debug(f"Step count update: total_steps={total_steps}, steps_done={steps_done}")
 
             # Process next observation for next step
             if isinstance(next_obs, tuple):
@@ -1238,6 +1250,12 @@ def main(args):
                 if args.use_lstm:
                     ppo_agent.process_done(done)
                 
+                # Log to TensorBoard periodically
+                if total_steps % 1000 == 0:
+                    # Capture a sample state for visualization
+                    if args.verbosity > 1:
+                        tb_logger.log_image('state/observation', next_obs[0], step=total_steps)
+                
                 # ... existing episode completion code ...
                 break
         
@@ -1248,6 +1266,34 @@ def main(args):
                 next_value = next_value.item()
         else:
             next_value = 0.0  # Terminal state has value 0
+            
+            # Increment episode counter when episode is complete
+            episode_count += 1
+            logger.debug(f"Episode {episode_count} completed after {episode_length} steps")
+            
+            # Log episode completion
+            logger.log_episode(
+                episode=episode_count,
+                reward=episode_reward,
+                length=episode_length,
+                floor=current_floor,
+                max_floor=max_floor_reached,
+                steps=total_steps,
+                steps_per_sec=total_steps / (time.time() - start_time)
+            )
+            
+            # Log to TensorBoard
+            tb_logger.log_episode(
+                reward=episode_reward,
+                length=episode_length,
+                floor=current_floor,
+                max_floor=max_floor_reached,
+                step_count=total_steps
+            )
+            
+            # Also log reward component breakdown
+            for component, value in reward_components.items():
+                tb_logger.log_scalar(f"reward_components/{component}", value, step=total_steps)
             
             # Reset for next episode
             try:
@@ -1268,10 +1314,11 @@ def main(args):
             # Reset key tracking
             env._previous_keys = None
             env._previous_position = None
+            prev_info = None
 
         # Add current trajectory to experience replay if enabled
         if args.experience_replay:
-            add_to_replay(replay_buffer, states, actions, rewards, log_probs, values, dones, max_replay_size)
+            add_to_replay(replay_buffer, states, actions, rewards, log_probs, values, dones, max_replay_size, logger)
             
             # Log replay buffer size occasionally
             if steps_done % 10000 == 0:
@@ -1307,7 +1354,7 @@ def main(args):
                 try:
                     # We need to include dones in the sample for proper sequence handling
                     states, actions, returns, advantages, old_log_probs, dones_sampled = sample_from_replay(
-                        replay_buffer, ppo_agent.batch_size, include_dones=True
+                        replay_buffer, ppo_agent.batch_size, include_dones=True, logger=logger
                     )
                     
                     # Process data for recurrent policy using the improved sequence handling
@@ -1321,7 +1368,7 @@ def main(args):
                     )
                     optimization_steps += 1
                 except Exception as e:
-                    logger.log_event("ERROR", f"LSTM update failed: {e}")
+                    logger.error(f"LSTM update failed: {e}")
                     import traceback
                     traceback.print_exc()
                     
@@ -1329,23 +1376,23 @@ def main(args):
                     try:
                         logger.log_event("RECOVERY", "Attempting fallback to non-recurrent update")
                         states, actions, returns, advantages, old_log_probs = sample_from_replay(
-                            replay_buffer, ppo_agent.batch_size
+                            replay_buffer, ppo_agent.batch_size, logger=logger
                         )
                         metrics = ppo_agent.update(states, actions, old_log_probs, returns, advantages)
                         optimization_steps += 1
                     except Exception as e2:
-                        logger.log_event("FATAL", f"Fallback update also failed: {e2}")
+                        logger.error(f"Fallback update also failed: {e2}")
                         # Skip this update to avoid terminating training
             else:
                 # Standard update for non-recurrent policy
                 try:
                     states, actions, returns, advantages, old_log_probs = sample_from_replay(
-                        replay_buffer, ppo_agent.batch_size
+                        replay_buffer, ppo_agent.batch_size, logger=logger
                     )
                     metrics = ppo_agent.update(states, actions, old_log_probs, returns, advantages)
                     optimization_steps += 1
                 except Exception as e:
-                    logger.log_event("ERROR", f"Update failed: {e}")
+                    logger.error(f"Update failed: {e}")
                     import traceback
                     traceback.print_exc()
                     # Skip this update
@@ -1361,19 +1408,41 @@ def main(args):
                     
             # Log update regardless of whether it succeeded
             logger.log_update(optimization_steps, metrics if 'metrics' in locals() else {"error": "update_failed"})
+            
+            # Log to TensorBoard
+            if 'metrics' in locals() and metrics:
+                tb_logger.log_update(metrics)
+            
+            # Add diagnostic code to check learning
+            if optimization_steps in [1, 5, 10, 20]:
+                logger.log_event("DIAGNOSTIC", f"Testing policy after {optimization_steps} updates")
+                with torch.no_grad():
+                    test_state = torch.FloatTensor(state).unsqueeze(0).to(device)
+                    policy_logits, value = model(test_state)
+                    probs = F.softmax(policy_logits, dim=1)
+                    prob_info = {f"action_{i}": float(p) for i, p in enumerate(probs[0].cpu().numpy()) if p > 0.01}
+                    logger.log_event("DIAGNOSTIC", f"Action probs: {prob_info}")
+                    logger.log_event("DIAGNOSTIC", f"Value estimate: {float(value.item())}")
+                    
+                    # Check if policy is becoming non-random
+                    max_prob = float(probs.max().item())
+                    if max_prob > 0.9:
+                        logger.log_event("WARNING", f"Policy too deterministic (max prob: {max_prob})")
+                    elif max_prob < 0.2:
+                        logger.log_event("WARNING", f"Policy too random (max prob: {max_prob})")
                 
-                # Adaptive entropy regulation - increase entropy if stuck on a floor
+            # Adaptive entropy regulation - increase entropy if stuck on a floor
             if current_floor <= 2 and optimization_steps % 50 == 0:
-                    # Check if we've been stuck on the same floor for a while
-                    if len(metrics_tracker.metrics.get('episode_floors', [])) > 10:
-                        recent_floors = metrics_tracker.metrics['episode_floors'][-10:]
-                        max_recent_floor = max(recent_floors) if recent_floors else 0
-                        
-                        if max_recent_floor <= 2:
-                            # We're stuck on early floors - increase entropy temporarily
-                            old_entropy = ppo_agent.ent_reg
-                            ppo_agent.ent_reg = min(0.1, ppo_agent.ent_reg * 1.5)  # Increase entropy up to 0.1
-                            logger.log_event("TUNING", f"Increasing entropy from {old_entropy:.4f} to {ppo_agent.ent_reg:.4f} to escape floor {max_recent_floor}")
+                # Check if we've been stuck on the same floor for a while
+                if len(metrics_tracker.metrics.get('episode_floors', [])) > 10:
+                    recent_floors = metrics_tracker.metrics['episode_floors'][-10:]
+                    max_recent_floor = max(recent_floors) if recent_floors else 0
+                    
+                    if max_recent_floor <= 2:
+                        # We're stuck on early floors - increase entropy temporarily
+                        old_entropy = ppo_agent.ent_reg
+                        ppo_agent.ent_reg = min(0.1, ppo_agent.ent_reg * 1.5)  # Increase entropy up to 0.1
+                        logger.log_event("TUNING", f"Increasing entropy from {old_entropy:.4f} to {ppo_agent.ent_reg:.4f} to escape floor {max_recent_floor}")
                 
             # Clear replay buffer after update
             replay_buffer = {
@@ -1383,28 +1452,39 @@ def main(args):
         
         # Run evaluation periodically
         if steps_done - last_eval_time >= args.eval_interval:
-            eval_reward, eval_max_floor = evaluate_policy(
-                model=model,
-                env_path=args.env_path,
-                seed=args.seed,
-                device=device,
-                action_flattener=action_flattener,
-                training_logger=logger,
-                num_episodes=args.eval_episodes
-            )
-            last_eval_time = steps_done
+            logger.log_event("EVAL", f"Starting evaluation at step {steps_done}")
+            
+            # Record and log video
+            try:
+                eval_frames = record_eval_video(
+                    model, 
+                    env, 
+                    device, 
+                    action_flattener, 
+                    max_steps=500, 
+                    use_lstm=args.use_lstm
+                )
+                
+                # Log the video to TensorBoard
+                if eval_frames:
+                    tb_logger.log_video('evaluation/video', eval_frames, step=steps_done)
+                    logger.log_event("EVAL", f"Recorded and saved evaluation video at step {steps_done}")
+            except Exception as e:
+                logger.error(f"Error recording evaluation video: {e}")
             
             # Save a checkpoint after evaluation
-            checkpoint_path = os.path.join(args.log_dir, f"eval_step_{steps_done}.pth")
+            checkpoint_path = os.path.join(log_dir, f"eval_step_{steps_done}.pth")
             save_checkpoint(
                 model, 
                 checkpoint_path, 
                 optimizer=ppo_agent.optimizer, 
                 scheduler=ppo_agent.scheduler, 
-                metrics=metrics_tracker.metrics
+                metrics=metrics_tracker.metrics,
+                update_count=optimization_steps
             )
             
             logger.log_event("CHECKPOINT", f"Saved post-evaluation checkpoint at step {steps_done}")
+            last_eval_time = steps_done
             
         # Save metrics and checkpoints periodically
         current_time = time.time()
@@ -1428,7 +1508,7 @@ def main(args):
             metrics_tracker.save(plot=False)
             
             # Save checkpoint
-            checkpoint_path = os.path.join(args.log_dir, f"step_{steps_done}.pth")
+            checkpoint_path = os.path.join(log_dir, f"step_{steps_done}.pth")
             save_checkpoint(
                 model, 
                 checkpoint_path, 
@@ -1441,34 +1521,10 @@ def main(args):
             logger.log_event("CHECKPOINT", f"Saved checkpoint at step {steps_done}")
             last_save_time = current_time
 
-        # Add this check after PPO updates
+        # Reset optimizer periodically
         if optimization_steps % 200 == 0 or ppo_agent.optimizer.param_groups[0]['lr'] < 5e-5:
             ppo_agent.reset_optimizer_state()
-
-        # Apply floor-specific reward scaling to prioritize progression
-        # Lower floors get reduced reward scale over time to encourage moving higher
-        floor_scaling_factor = 1.0
-        
-        # Gradually reduce reward scale for easier floors as training progresses
-        if steps_done > 100000:  # After initial learning period
-            current_max_floor = max_floor_reached
-            progress_ratio = min(1.0, steps_done / args.num_steps)
-            
-            # Calculate floor-specific scaling
-            # Floors far below the max get diminished rewards
-            if current_floor < current_max_floor - 1:
-                # Scale down rewards for floors more than 1 below max
-                floor_gap = current_max_floor - current_floor
-                # Stronger reduction as training progresses and gap increases
-                reduction = 0.3 * progress_ratio * min(floor_gap, 3)  # Cap at 3 floors difference
-                floor_scaling_factor = max(0.5, 1.0 - reduction)  # Don't go below 50%
-                
-                # Log when we apply significant scaling
-                if floor_scaling_factor < 0.8 and steps_done % 100 == 0:
-                    logger.log_event("REWARD_SHAPING", f"Applying floor scaling factor {floor_scaling_factor:.2f} (floor {current_floor} vs max {current_max_floor})")
-            
-            # Apply the scaling factor
-            shaped_reward *= floor_scaling_factor
+            logger.log_event("OPTIMIZATION", "Reset optimizer state")
 
         # Periodically update ICM with recent experience
         if args.use_icm and ppo_agent.icm is not None and len(replay_buffer['states']) >= args.batch_size and step % 10 == 0:
@@ -1528,22 +1584,50 @@ def main(args):
                 # Update ICM
                 icm_metrics = ppo_agent.update_icm(icm_states, icm_actions, icm_next_states)
                 
-                # Log ICM metrics
+                # Log ICM metrics to TensorBoard
                 if icm_metrics and step % 100 == 0:
                     for key, value in icm_metrics.items():
                         metrics_tracker.update(f"icm/{key}", value)
+                        tb_logger.log_scalar(f"icm/{key}", value, step=total_steps)
             except Exception as e:
                 # Log error but don't crash training
                 # Replace direct print with logging call
                 logger.log_event("ERROR", f"Error updating ICM: {e}")
 
-    # Final cleanup
+        # Periodically report training progress
+        current_time = time.time()
+        time_since_last_report = current_time - last_log_time
+        
+        # Log training summary every minute
+        if time_since_last_report > 60:  # Every minute
+            report_progress()  # Use our helper function for consistent reporting
+            last_log_time = current_time
+
+    # Final cleanup and logging
+    logger.log_event("TRAINING", "Training loop completed")
+    
+    # Save final checkpoint
+    final_checkpoint_path = os.path.join(log_dir, "final_model.pth")
+    save_checkpoint(
+        model, 
+        final_checkpoint_path, 
+        optimizer=ppo_agent.optimizer, 
+        scheduler=ppo_agent.scheduler, 
+        metrics=metrics_tracker.metrics,
+        update_count=optimization_steps
+    )
+    logger.log_event("CHECKPOINT", f"Saved final model to {final_checkpoint_path}")
+    
+    # Close loggers
     logger.close()
+    tb_logger.close()
+    
+    # Close environment
     env.close()
 
     return model, metrics_tracker, logger.metrics
 
-def add_to_replay(replay_buffer, states, actions, rewards, log_probs, values, dones, max_replay_size):
+def add_to_replay(replay_buffer, states, actions, rewards, log_probs, values, dones, max_replay_size, logger=None):
     """Add trajectory to the replay buffer."""
     # Add all the standard entries
     replay_buffer['states'].extend(states)
@@ -1571,8 +1655,11 @@ def add_to_replay(replay_buffer, states, actions, rewards, log_probs, values, do
         excess = len(replay_buffer['states']) - max_replay_size
         for key in replay_buffer:
             replay_buffer[key] = replay_buffer[key][excess:]
+        
+        if logger and logger.verbosity > 1:
+            logger.debug(f"Replay buffer trimmed, removed {excess} old entries")
 
-def sample_from_replay(replay_buffer, batch_size, include_dones=False):
+def sample_from_replay(replay_buffer, batch_size, include_dones=False, logger=None):
     """Sample a batch of experiences from the replay buffer."""
     buffer_size = len(replay_buffer['states'])
     if buffer_size == 0:
@@ -1615,7 +1702,8 @@ def sample_from_replay(replay_buffer, batch_size, include_dones=False):
                     np.array(old_log_probs, dtype=np.float32), 
                     np.array(dones, dtype=np.float32))
         except Exception as e:
-            debug_print(f"Error in sample_from_replay: {e}")
+            if logger:
+                logger.debug(f"Error in sample_from_replay: {e}")
             # Fall back to lists if numpy conversion fails
             return states, actions, returns, advantages, old_log_probs, dones
     else:
@@ -1626,193 +1714,95 @@ def sample_from_replay(replay_buffer, batch_size, include_dones=False):
                     np.array(advantages, dtype=np.float32), 
                     np.array(old_log_probs, dtype=np.float32))
         except Exception as e:
-            debug_print(f"Error in sample_from_replay: {e}")
+            if logger:
+                logger.debug(f"Error in sample_from_replay: {e}")
             # Fall back to lists if numpy conversion fails
             return states, actions, returns, advantages, old_log_probs
 
-def evaluate_policy(model, env_path, seed, device, action_flattener, training_logger, num_episodes=5):
-    """Evaluate the policy without exploration."""
-    eval_env = create_obstacle_tower_env(
-        executable_path=env_path,
-        realtime_mode=False,
-        timeout=300
-    )
-    eval_env.seed(seed + 100)  # Different seed for evaluation
-    
-    # Check if the model is recurrent
-    is_recurrent = hasattr(model, 'use_lstm') and model.use_lstm
-    
-    total_reward = 0
-    max_floor = 0
-    
-    for episode in range(num_episodes):
-        obs = eval_env.reset()
-        done = False
-        episode_reward = 0
-        
-        # Initialize frame stack
-        frame_stack = deque(maxlen=4)
-        obs = np.transpose(obs[0], (2, 0, 1)) / 255.0
-        for _ in range(4):
-            frame_stack.append(obs)
-        
-        # Initialize LSTM state for recurrent policies
-        lstm_state = None
-        if is_recurrent:
-            lstm_state = model.init_lstm_state(batch_size=1, device=device)
-        
-        while not done:
-            state = np.concatenate(list(frame_stack), axis=0)
-            state_tensor = torch.FloatTensor(state).unsqueeze(0).to(device)
-            
-            # Use deterministic actions for evaluation
-            with torch.no_grad():
-                if is_recurrent:
-                    # Forward pass through recurrent model
-                    policy_logits, _, next_lstm_state = model(state_tensor, lstm_state)
-                    lstm_state = next_lstm_state  # Update LSTM state
-                else:
-                    # Standard forward pass
-                    policy_logits, _ = model(state_tensor)
-                
-                # Select best action
-                action_idx = torch.argmax(policy_logits, dim=1).item()
-                action = action_flattener.lookup_action(action_idx)
-                action = np.array(action)
-                
-            next_obs, reward, done, info = eval_env.step(action)
-            episode_reward += reward
-            
-            # Update frame stack
-            if isinstance(next_obs, tuple):
-                next_obs = next_obs[0]  # Handle tuple observation
-            next_obs = np.transpose(next_obs, (2, 0, 1)) / 255.0
-            frame_stack.append(next_obs)
-            
-            # Track max floor
-            if info.get("current_floor", 0) > max_floor:
-                max_floor = info["current_floor"]
-        
-        # Reset LSTM state between episodes
-        if is_recurrent:
-            lstm_state = None
-            
-        total_reward += episode_reward
-        
-    eval_env.close()
-    avg_reward = total_reward / num_episodes
-    
-    print(f"Evaluation: Avg Reward: {avg_reward:.2f}, Max Floor: {max_floor}")
-    if training_logger:
-        training_logger.log_event("EVAL", f"Evaluation results: Avg Reward: {avg_reward:.2f}, Max Floor: {max_floor}")
-    return avg_reward, max_floor
-
-def preprocess_observation(observation):
-    """
-    Preprocess observation for neural network input.
-    
-    Args:
-        observation: Raw observation from environment
-        
-    Returns:
-        Preprocessed observation tensor
-    """
-    if observation is None:
-        # Return zeros for None observations (can happen at end of episodes)
-        return torch.zeros((3, 84, 84), dtype=torch.float32)
-        
-    # If observation is a tuple, extract visual observation
-    if isinstance(observation, tuple):
-        observation = observation[0]
-        
-    # Convert to numpy array if not already
-    if not isinstance(observation, np.ndarray):
-        observation = np.array(observation)
-        
-    # Check if already in [C,H,W] format 
-    if observation.shape[0] == 3 and len(observation.shape) == 3:
-        # Already in correct format, just normalize
-        obs_array = observation / 255.0
-    else:
-        # Need to transpose from [H,W,C] to [C,H,W]
-        obs_array = np.transpose(observation, (2, 0, 1)) / 255.0
-        
-    # Convert to PyTorch tensor
-    obs_tensor = torch.from_numpy(obs_array).float()
-    
-    # Ensure the tensor is contiguous in memory for better performance
-    if not obs_tensor.is_contiguous():
-        obs_tensor = obs_tensor.contiguous()
-        
-    # Resize the observation if needed using interpolation (faster than crop/resize chains)
-    if obs_tensor.shape[1:] != (84, 84):
-        obs_tensor = torch.nn.functional.interpolate(
-            obs_tensor.unsqueeze(0), 
-            size=(84, 84), 
-            mode='bilinear', 
-            align_corners=False
-        ).squeeze(0)
-    
-    return obs_tensor
-
 def preprocess_observation_for_icm(observation, frame_stack):
     """
-    Preprocess observation specifically for ICM input, ensuring correct format 
-    with stacked frames for the ICM module.
+    Preprocess observation for ICM (Intrinsic Curiosity Module).
     
     Args:
         observation: Raw observation from environment
-        frame_stack: Deque containing previous frames
+        frame_stack: List of previous observations for frame stacking
         
     Returns:
-        Tensor with stacked frames suitable for ICM input [B, 12, 84, 84]
+        Preprocessed observation with frame stacking as PyTorch tensor
     """
     # Process the current observation
-    processed_frame = preprocess_observation(observation)
+    try:
+        if isinstance(observation, tuple):
+            obs_img = observation[0]
+        else:
+            obs_img = observation
+            
+        # Convert to channels-first format if needed
+        if obs_img.shape[-1] == 3:  # [H, W, C] format
+            processed_frame = np.transpose(obs_img, (2, 0, 1))
+        else:
+            processed_frame = obs_img
+            
+        # Normalize to [0, 1]
+        if processed_frame.max() > 1.0:
+            processed_frame = processed_frame / 255.0
+            
+        # Resize to 84x84 if needed
+        if processed_frame.shape[1:] != (84, 84):
+            # Save original format for reshaping
+            channels = processed_frame.shape[0]
+            # Reshape to HWC for cv2
+            reshaped = np.transpose(processed_frame, (1, 2, 0))
+            resized = cv2.resize(reshaped, (84, 84))
+            # Back to CHW
+            processed_frame = np.transpose(resized, (2, 0, 1))
+    except Exception as e:
+        print(f"Error in preprocess_observation_for_icm: {e}")
+        # Emergency fallback - create a blank frame
+        processed_frame = np.zeros((3, 84, 84), dtype=np.float32)
     
-    if frame_stack and len(frame_stack) == 4:
-        # Use the frame stack to create a 12-channel input
-        frames = list(frame_stack)
-        # Optimize by pre-allocating tensor and copying data
-        stacked_frames = torch.zeros(12, 84, 84, dtype=torch.float32)
+    # If frame_stack is empty or None, create a new stack with the current frame repeated
+    if not frame_stack:
+        stacked_frames = np.concatenate([processed_frame] * 4, axis=0)  # Repeat the same frame 4 times
+        return torch.FloatTensor(stacked_frames)  # Convert to torch tensor
+    
+    # Otherwise, add the new frame to the stack and return the concatenated result
+    frame_stack.append(processed_frame)
+    if len(frame_stack) > 4:
+        frame_stack.pop(0)  # Remove oldest frame if we have more than 4
         
-        # Track how many valid frames we've processed
-        valid_frames = 0
-        offset = 0
+    # Stack the frames along the channel dimension
+    while len(frame_stack) < 4:
+        frame_stack.append(processed_frame)  # Pad with copies if not enough frames
         
-        for frame in frames:
-            if isinstance(frame, np.ndarray):
-                # If frame is numpy array, convert to tensor
-                if frame.shape[0] == 3:
-                    # Already in [C,H,W] format
-                    frame_tensor = torch.from_numpy(frame).float()
-                else:
-                    # Need to transpose
-                    frame_tensor = torch.from_numpy(np.transpose(frame, (2, 0, 1)) / 255.0).float()
-            elif isinstance(frame, torch.Tensor):
-                frame_tensor = frame
+    # Verify the shapes before concatenating
+    for i, frame in enumerate(frame_stack):
+        if frame.shape != (3, 84, 84):
+            print(f"Warning: Frame {i} has unexpected shape {frame.shape}, reshaping...")
+            # Try to reshape if possible
+            if frame.size == 3*84*84:
+                frame_stack[i] = frame.reshape(3, 84, 84)
             else:
-                continue
-                
-            # Ensure frame has correct shape
-            if frame_tensor.shape[0] == 3 and frame_tensor.shape[1:] == (84, 84):
-                # Copy directly into pre-allocated tensor for better performance
-                stacked_frames[offset:offset+3] = frame_tensor
-                offset += 3
-                valid_frames += 1
-        
-        # If we have enough frames, return the stacked tensor
-        if valid_frames == 4:
-            return stacked_frames
+                # Replace with zeros if shape is wrong
+                frame_stack[i] = np.zeros((3, 84, 84), dtype=np.float32)
     
-    # Fallback: Just repeat the current frame 4 times to get 12 channels
-    # This is more efficient than multiple concatenation operations
-    return processed_frame.repeat(4, 1, 1)
+    # Concatenate the frames
+    try:
+        stacked_frames = np.concatenate(frame_stack, axis=0)
+        # Verify the final shape
+        assert stacked_frames.shape == (12, 84, 84), f"Stacked frames have shape {stacked_frames.shape}, expected (12, 84, 84)"
+        # Convert to PyTorch tensor
+        return torch.FloatTensor(stacked_frames)
+    except Exception as e:
+        print(f"Error concatenating frames: {e}")
+        # Emergency fallback - create a blank stacked frame
+        stacked_frames = np.zeros((12, 84, 84), dtype=np.float32)
+        return torch.FloatTensor(stacked_frames)
 
 if __name__ == "__main__":
     import argparse
     import datetime
-    import traceback  # Add traceback import
+    import traceback
     
     parser = argparse.ArgumentParser(description='Train PPO agent on Obstacle Tower')
     
@@ -1827,7 +1817,7 @@ if __name__ == "__main__":
                         help='Use curriculum learning to gradually increase difficulty')
     
     # PPO hyperparameters
-    parser.add_argument('--lr', type=float, default=2.5e-4,
+    parser.add_argument('--lr', type=float, default=1e-4,  # Updated default learning rate
                         help='Learning rate')
     parser.add_argument('--gamma', type=float, default=0.99,
                         help='Discount factor')
@@ -1835,24 +1825,24 @@ if __name__ == "__main__":
                         help='GAE lambda parameter')
     parser.add_argument('--clip_eps', type=float, default=0.2,
                         help='PPO clipping parameter')
-    parser.add_argument('--epochs', type=int, default=3,
+    parser.add_argument('--epochs', type=int, default=4,  # Increased from 3 to 4
                         help='Number of PPO epochs')
-    parser.add_argument('--batch_size', type=int, default=128,
+    parser.add_argument('--batch_size', type=int, default=256,  # Increased from 128 to 256
                         help='PPO batch size')
-    parser.add_argument('--entropy_reg', type=float, default=0.02,
-                        help='Entropy regularization coefficient')
+    parser.add_argument('--entropy_reg', type=float, default=0.01,  # Reduced from 0.02 to 0.01
+                        help='Entropy regularization coefficient to encourage exploration')
     parser.add_argument('--vf_coef', type=float, default=0.5, 
                         help='Value function loss coefficient')
     parser.add_argument('--max_grad_norm', type=float, default=0.5,
                         help='Maximum gradient norm for clipping')
-    parser.add_argument('--target_kl', type=float, default=0.01,
+    parser.add_argument('--target_kl', type=float, default=0.025,  # Updated from 0.01 to 0.025
                         help='Target KL divergence for early stopping')
                         
     # ICM parameters
     parser.add_argument('--use_icm', action='store_true',
                         help='Use Intrinsic Curiosity Module for exploration')
-    parser.add_argument('--icm_reward_scale', type=float, default=0.01,
-                        help='Scaling factor for intrinsic rewards')
+    parser.add_argument('--icm_reward_scale', type=float, default=0.01,  # Reduced from 0.05 to 0.01
+                        help='Scale factor for intrinsic rewards from ICM')
     parser.add_argument('--icm_forward_weight', type=float, default=0.2,
                         help='Weight for ICM forward model loss')
     parser.add_argument('--icm_inverse_weight', type=float, default=0.8,
@@ -1890,7 +1880,7 @@ if __name__ == "__main__":
     
     # Add verbosity controls
     parser.add_argument('--verbosity', type=int, default=1, choices=[0, 1, 2],
-                        help='Console verbosity level: 0=minimal, 1=normal, 2=verbose')
+                        help='Verbosity level: 0=minimal output, 1=show ALL episode results without debug info, 2=verbose with debug info')
     parser.add_argument('--console_log_freq', type=int, default=100,
                         help='How often to print episode results to console (every N episodes)')
     parser.add_argument('--visualize_freq', type=int, default=1000,
@@ -1905,13 +1895,85 @@ if __name__ == "__main__":
                         help='Use LSTM-based recurrent policy for better memory')
     parser.add_argument('--lstm_hidden_size', type=int, default=256,
                         help='Hidden size of LSTM layer')
-    parser.add_argument('--sequence_length', type=int, default=8,
+    parser.add_argument('--sequence_length', type=int, default=16,  # Increased from 8 to 16
                         help='Sequence length for LSTM training')
+    
+    # Add realtime mode and graphics options
+    parser.add_argument('--realtime_mode', action='store_true',
+                        help='Run environment in realtime mode to watch training')
+    parser.add_argument('--graphics', action='store_true',
+                        help='Enable graphics (disable no_graphics) to visualize training')
     
     args = parser.parse_args()
     
+    # Create a timestamp for the run
+    timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+    log_dir = os.path.join(args.log_dir, f"run_{timestamp}")
+    os.makedirs(log_dir, exist_ok=True)
+    
+    # Setup a simple logger for startup messages before main logger is created
+    startup_logger = logging.getLogger('startup')
+    startup_logger.setLevel(logging.INFO)
+    
+    # Add console handler
+    console_handler = logging.StreamHandler()
+    console_formatter = logging.Formatter('%(levelname)s: %(message)s')
+    console_handler.setFormatter(console_formatter)
+    startup_logger.addHandler(console_handler)
+    
     try:
-        main(args)
+        # Create enhanced logger
+        logger = EnhancedLogger(
+            log_dir=log_dir,
+            console_freq=1 if args.verbosity >= 1 else args.console_log_freq,
+            visualize_freq=args.visualize_freq,
+            verbosity=args.verbosity,
+            log_intrinsic_rewards=args.use_icm and args.verbosity >= 2
+        )
+        
+        # Create TensorBoard logger
+        tb_logger = TensorboardLogger(os.path.join(log_dir, 'tensorboard'))
+        
+        logger.log_event("STARTUP", "Starting Obstacle Tower training")
+        
+        # Run main training function
+        model, metrics_tracker, final_metrics = main(args)
+        
+        # Log completion
+        logger.log_event("COMPLETION", "Training completed successfully")
+        
+        # Final cleanup
+        logger.close()
+        tb_logger.close()
+        
+    except KeyboardInterrupt:
+        startup_logger.warning("Training interrupted by user")
+        if 'logger' in locals():
+            logger.warning("Training interrupted by user")
+            logger.close()
+            
+        if 'tb_logger' in locals():
+            tb_logger.close()
+            
     except Exception as e:
-        print(f"Error: {e}")
-        traceback.print_exc()
+        error_msg = f"Error: {e}"
+        traceback_str = traceback.format_exc()
+        
+        # Log to startup logger if enhanced logger not created yet
+        if 'logger' not in locals():
+            startup_logger.error(error_msg)
+            startup_logger.error(traceback_str)
+            
+            # Create a basic log file for the error
+            error_log_path = os.path.join(log_dir, "error.log")
+            with open(error_log_path, 'w') as f:
+                f.write(f"{error_msg}\n\n{traceback_str}")
+            print(f"Error details written to {error_log_path}")
+        else:
+            # Use enhanced logger if available
+            logger.error(error_msg)
+            logger.error(traceback_str)
+            logger.close()
+            
+        if 'tb_logger' in locals():
+            tb_logger.close()

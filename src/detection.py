@@ -1,5 +1,14 @@
 import numpy as np
 import cv2
+import os
+
+# Get global verbosity level from environment variable
+VERBOSITY = int(os.environ.get('VERBOSITY', '1'))
+
+def debug_print(*args, **kwargs):
+    """Only print if verbosity level is high enough."""
+    if VERBOSITY >= 2:  # Only print at verbosity level 2 or higher
+        print(*args, **kwargs)
 
 def detect_key_visually(observation, previous_observation):
     """

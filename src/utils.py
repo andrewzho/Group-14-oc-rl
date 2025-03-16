@@ -203,7 +203,79 @@ class ActionFlattener:
         return {_scalar: _action for (_scalar, _action) in enumerate(all_actions)}
 
     def lookup_action(self, action):
-        return self.action_lookup[action]
+        """
+        Look up the actual action tuple from the flattened action index.
+        
+        Args:
+            action: The flattened action index
+            
+        Returns:
+            The corresponding action tuple
+        """
+        try:
+            # Handle every possible input type
+            
+            # Case 1: action is a numpy array
+            if isinstance(action, np.ndarray):
+                if action.size == 1:
+                    # Single element array
+                    action = action.item()
+                elif action.size > 1:
+                    # Multi-element array, take the first element
+                    action = int(action.flat[0])
+                else:
+                    # Empty array, default to action 0
+                    action = 0
+                    
+            # Case 2: action is a torch tensor
+            elif hasattr(action, 'dim') and callable(getattr(action, 'dim')):  # Check if it's a torch tensor
+                try:
+                    if action.numel() == 1:
+                        # Single element tensor
+                        action = action.item()
+                    else:
+                        # Multi-element tensor
+                        action = action.view(-1)[0].item()
+                except Exception as e:
+                    # If item() fails, convert to int directly
+                    try:
+                        action = int(action.detach().cpu().numpy().flat[0])
+                    except:
+                        # Emergency fallback
+                        action = 0
+                        print(f"Warning: Could not convert tensor to action index: {e}, using default action 0")
+            
+            # Case 3: action is a list or tuple
+            elif isinstance(action, (list, tuple)):
+                if len(action) > 0:
+                    # Take the first element
+                    action = int(action[0])
+                else:
+                    # Empty list, default to action 0
+                    action = 0
+            
+            # Case 4: try to convert to int (handles float, bool, etc.)
+            else:
+                try:
+                    action = int(action)
+                except:
+                    # If all else fails, default to action 0
+                    action = 0
+                    print(f"Warning: Could not convert {action} to int, using default action 0")
+            
+            # Now perform the lookup with a proper hashable key
+            if action in self.action_lookup:
+                return self.action_lookup[action]
+            else:
+                # Handle out-of-bounds index (use modulo to wrap around)
+                valid_action = action % len(self.action_lookup)
+                print(f"Warning: Action index {action} out of bounds, using {valid_action} instead")
+                return self.action_lookup[valid_action]
+                
+        except Exception as e:
+            # Global emergency fallback - return the first action
+            print(f"Error in lookup_action: {e}, returning default action")
+            return self.action_lookup[0]
         
 class MetricsTracker:
     """

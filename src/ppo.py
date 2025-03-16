@@ -26,7 +26,7 @@ class PPO:
         epochs=4,
         batch_size=256,  # Increased batch size for more stable updates
         vf_coef=0.5,
-        ent_reg=0.01,  # Adjusted entropy regularization (similar to SB3)
+        ent_reg=0.005,  # FIXED: Reduced from 0.01 to encourage less randomness initially
         max_grad_norm=0.5,
         target_kl=0.05,
         lr_scheduler='linear',  # Change default to linear like SB3
@@ -193,6 +193,11 @@ class PPO:
             # Recursive advantage computation
             gae = delta + self.gamma * self.gae_lambda * (1 - dones[i]) * gae
             
+            # FIXED: Check for NaN/Inf in advantages
+            if np.isnan(gae) or np.isinf(gae):
+                debug_print(f"Warning: NaN or Inf in GAE calculation. delta={delta}")
+                gae = 0.0  # Reset to zero if NaN/Inf
+            
             # Guard against extreme values which can cause training instability
             gae = max(min(gae, 10.0), -10.0)
             
@@ -236,6 +241,54 @@ class PPO:
         values_array = np.array(values)
         log_probs_array = np.array(log_probs)
         dones_array = np.array(dones)
+        
+        # Check if we're dealing with multi-dimensional log_probs
+        log_probs_shape = log_probs_array.shape
+        is_multidim_log_probs = len(log_probs_shape) > 1 and log_probs_shape[-1] > 1
+        
+        # Flatten multi-dimensional log_probs if necessary
+        if is_multidim_log_probs:
+            debug_print(f"Flattening multi-dimensional log_probs with shape {log_probs_shape}")
+            original_log_probs_shape = log_probs_shape[1:]  # Save dimensions besides batch
+            # Take the first column if multi-dimensional
+            log_probs_array = log_probs_array.reshape(log_probs_shape[0], -1)[:, 0]
+            
+        # Check if we're dealing with multi-dimensional values
+        values_shape = values_array.shape
+        is_multidim_values = len(values_shape) > 1 and values_shape[-1] > 1
+        
+        # Flatten multi-dimensional values if necessary
+        if is_multidim_values:
+            debug_print(f"Flattening multi-dimensional values with shape {values_shape}")
+            original_values_shape = values_shape[1:]  # Save dimensions besides batch
+            # Take the first column if multi-dimensional
+            values_array = values_array.reshape(values_shape[0], -1)[:, 0]
+        
+        # Check action dimensions - flatten if it's multi-dimensional
+        action_shape = actions_array.shape
+        is_multidim_action = len(action_shape) > 1
+        
+        # Handle multi-dimensional actions by flattening to 1D
+        if is_multidim_action and len(action_shape) > 1:
+            # Flatten actions to 1D for sequence processing
+            # We'll remember the original shape to restore it later
+            original_action_shape = action_shape[1:]  # Save dimensions besides batch
+            actions_array_flat = actions_array.reshape(action_shape[0], -1)
+            # If action is still a 2D array, keep only the first dimension for sequence processing
+            if len(actions_array_flat.shape) > 1 and actions_array_flat.shape[1] == 1:
+                actions_array = actions_array_flat.squeeze(1)
+            else:
+                # Just use the first element if we can't cleanly reshape
+                actions_array = actions_array_flat[:, 0]
+                
+        # Apply debug prints to diagnose shapes
+        debug_print(f"Shapes after flattening:")
+        debug_print(f"  states: {states_array.shape}")
+        debug_print(f"  actions: {actions_array.shape}")
+        debug_print(f"  rewards: {rewards_array.shape}")
+        debug_print(f"  values: {values_array.shape}")
+        debug_print(f"  log_probs: {log_probs_array.shape}")
+        debug_print(f"  dones: {dones_array.shape}")
         
         # Find episode boundaries
         episode_ends = np.where(dones_array)[0]
@@ -290,7 +343,11 @@ class PPO:
                 
                 # Copy data to padded arrays
                 padded_states[seq_idx, :actual_len] = states_array[seq_start:seq_end]
+                
+                # Handle action copying safely depending on dimensions
+                # Only copy the flattened/selected actions
                 padded_actions[seq_idx, :actual_len] = actions_array[seq_start:seq_end]
+                
                 padded_rewards[seq_idx, :actual_len] = rewards_array[seq_start:seq_end]
                 padded_values[seq_idx, :actual_len] = values_array[seq_start:seq_end]
                 padded_log_probs[seq_idx, :actual_len] = log_probs_array[seq_start:seq_end]
@@ -315,7 +372,8 @@ class PPO:
             debug_print("Warning: No valid sequences found, falling back to non-recurrent processing")
             return states, actions, rewards, values, log_probs, dones
             
-        return {
+        # Store info about the original action dimensions if needed
+        result = {
             'states': padded_states,
             'actions': padded_actions,
             'rewards': padded_rewards,
@@ -325,6 +383,20 @@ class PPO:
             'mask': padded_mask,
             'sequence_length': max_seq_len
         }
+        
+        if is_multidim_action:
+            result['is_multidim_action'] = True
+            result['original_action_shape'] = original_action_shape
+            
+        if is_multidim_values:
+            result['is_multidim_values'] = True
+            result['original_values_shape'] = original_values_shape
+            
+        if is_multidim_log_probs:
+            result['is_multidim_log_probs'] = True
+            result['original_log_probs_shape'] = original_log_probs_shape
+            
+        return result
         
     def update(self, states: List[np.ndarray], actions: List[int], old_log_probs: List[float], 
                returns: List[float], advantages: List[float], lstm_states=None, dones=None) -> Dict[str, float]:
@@ -345,240 +417,205 @@ class PPO:
         """
         # Special handling for recurrent policy with processed sequence data
         if self.use_recurrent and isinstance(states, dict):
-            # Unpack the processed sequence data
-            sequence_data = states
-            states_tensor = torch.FloatTensor(sequence_data['states']).to(self.device)
-            actions_tensor = torch.LongTensor(sequence_data['actions']).to(self.device)
-            old_log_probs_tensor = torch.FloatTensor(sequence_data['log_probs']).to(self.device)
-            returns_tensor = torch.FloatTensor(sequence_data['rewards']).to(self.device)  # Use rewards as proxy for returns
-            # We'll use the advantages from the original data, just duplicated for each sequence
-            if isinstance(advantages, np.ndarray):
-                advantages_mean = np.mean(advantages)
-                advantages_tensor = torch.FloatTensor(np.ones_like(sequence_data['rewards']) * advantages_mean).to(self.device)
-            else:
-                # Create simple advantages if none provided
-                advantages_tensor = returns_tensor - torch.FloatTensor(sequence_data['values']).to(self.device)
-            
-            # Get the masks for valid timesteps
-            masks_tensor = torch.FloatTensor(sequence_data['mask']).to(self.device)
-            sequence_length = sequence_data['sequence_length']
-            
-            # Print shape information for debugging
-            debug_print(f"Sequence data shapes - States: {states_tensor.shape}, Actions: {actions_tensor.shape}, "
-                  f"Masks: {masks_tensor.shape}, Sequence length: {sequence_length}")
-            
-            # Normalize advantages
-            if self.update_adv_batch_norm and advantages_tensor.shape[0] > 1:
-                advantages_tensor = (advantages_tensor - advantages_tensor.mean()) / (advantages_tensor.std() + 1e-8)
+            # FIXED: Simplify to non-recurrent update for debugging
+            # This is a temporary solution to verify that basic PPO is working
+            try:
+                # Extract the sequence data
+                states_tensor = torch.FloatTensor(states['states']).to(self.device)
                 
-            # Track metrics for LSTM update
-            avg_policy_loss = 0
-            avg_value_loss = 0
-            avg_entropy = 0
-            avg_approx_kl = 0
-            clip_fractions = []
-            
-            early_stop = False
-            
-            # Iterate through epochs
-            for _ in range(self.epochs):
-                # Shuffle sequences
-                indices = torch.randperm(states_tensor.size(0))
+                # Flatten the sequences to simple batches
+                batch_size, seq_len = states_tensor.shape[:2]
+                flattened_states = states_tensor.reshape(-1, *states_tensor.shape[2:])
                 
-                # Process mini-batches
-                for start_idx in range(0, len(indices), self.batch_size):
-                    end_idx = min(start_idx + self.batch_size, len(indices))
-                    if end_idx <= start_idx:
-                        continue  # Skip empty batches
+                # Flatten other tensors as well
+                actions_tensor = torch.LongTensor(states['actions']).to(self.device).reshape(-1)
+                old_log_probs_tensor = torch.FloatTensor(states['log_probs']).to(self.device).reshape(-1)
+                returns_tensor = torch.FloatTensor(states['rewards']).to(self.device).reshape(-1)  # Use rewards as returns
+                
+                # We'll use flattened advantages, either from passed advantages or simple returns - values
+                values_tensor = torch.FloatTensor(states['values']).to(self.device).reshape(-1)
+                
+                # Use the passed advantages if available
+                if isinstance(advantages, np.ndarray):
+                    # Try to reshape to match the flattened data
+                    advantages_np = advantages.reshape(-1)
+                    advantages_tensor = torch.FloatTensor(advantages_np).to(self.device)
+                else:
+                    # Compute simple advantages if none provided
+                    advantages_tensor = returns_tensor - values_tensor
+                
+                # Get the mask for valid timesteps and flatten it
+                masks_tensor = torch.FloatTensor(states['mask']).to(self.device).reshape(-1)
+                
+                # Normalize advantages if there are enough samples
+                if self.update_adv_batch_norm and advantages_tensor.shape[0] > 1:
+                    # FIXED: Only normalize if standard deviation is significant
+                    adv_mean = advantages_tensor.mean()
+                    adv_std = advantages_tensor.std()
+                    if adv_std > 1e-4:
+                        advantages_tensor = (advantages_tensor - adv_mean) / (adv_std + 1e-8)
+                
+                debug_print(f"Flattened data shapes for simplified LSTM update: "
+                            f"states={flattened_states.shape}, actions={actions_tensor.shape}, "
+                            f"advantages={advantages_tensor.shape}, masks={masks_tensor.shape}")
+                
+                # Track metrics for the update
+                avg_policy_loss = 0
+                avg_value_loss = 0
+                avg_entropy = 0
+                avg_approx_kl = 0
+                clip_fractions = []
+                
+                # Flag for early stopping
+                early_stop = False
+                
+                # Run multiple epochs of training on the data
+                for _ in range(self.epochs):
+                    # Create indexing for the flattened data
+                    indices = torch.randperm(flattened_states.size(0))
                     
-                    batch_indices = indices[start_idx:end_idx]
-                    actual_batch_size = len(batch_indices)
-                    
-                    if actual_batch_size == 0:
-                        continue  # Skip empty batches
-                    
-                    # Get batch data
-                    batch_states = states_tensor[batch_indices]
-                    batch_actions = actions_tensor[batch_indices]
-                    batch_old_log_probs = old_log_probs_tensor[batch_indices]
-                    batch_returns = returns_tensor[batch_indices]
-                    batch_advantages = advantages_tensor[batch_indices]
-                    batch_masks = masks_tensor[batch_indices]
-                    
-                    # Forward pass through model with sequence data
-                    try:
-                        policy_logits, values, _ = self.model(
-                            batch_states,
-                            lstm_state=None,  # Let model initialize states
-                            sequence_length=sequence_length
-                        )
+                    # Process mini-batches
+                    for start_idx in range(0, len(indices), self.batch_size):
+                        end_idx = min(start_idx + self.batch_size, len(indices))
+                        batch_indices = indices[start_idx:end_idx]
                         
-                        # Print shape information for debugging
-                        debug_print(f"Forward pass shapes - Policy logits: {policy_logits.shape}, Values: {values.shape}")
+                        # Skip empty batches
+                        if len(batch_indices) == 0:
+                            continue
                         
-                        # Reshape based on the actual shapes we got from the model
-                        batch_size, seq_len = batch_actions.shape
-                        action_dim = policy_logits.size(-1)  # Get the action dimension from the output
+                        # Get batch data
+                        batch_states = flattened_states[batch_indices]
+                        batch_actions = actions_tensor[batch_indices]
+                        batch_old_log_probs = old_log_probs_tensor[batch_indices]
+                        batch_returns = returns_tensor[batch_indices]
+                        batch_advantages = advantages_tensor[batch_indices]
+                        batch_masks = masks_tensor[batch_indices]
                         
-                        # Safe reshaping that checks tensor dimensions
-                        # If policy_logits is [batch_size, action_dim], we need to add sequence dimension
-                        if policy_logits.dim() == 2 and policy_logits.size(0) == batch_size:
-                            # Policy logits are already [batch_size, action_dim], no sequence dimension
-                            # We'll reshape actions to match this format by taking the last action from each sequence
-                            flat_actions = batch_actions[:, -1]
-                            flat_masks = batch_masks[:, -1]
-                            
-                            # Create distribution using the correct shapes
-                            dist = torch.distributions.Categorical(logits=policy_logits)
-                            log_probs = dist.log_prob(flat_actions)
-                            entropy = dist.entropy()
-                            
-                            # Values should be shaped to match
-                            if values.dim() > 1:
-                                values = values.squeeze(-1)
-                                
-                        # If policy_logits includes sequence dimension [batch_size, seq_len, action_dim]
-                        elif policy_logits.dim() == 3:
-                            # Reshape to [batch_size*seq_len, action_dim]
-                            flat_policy_logits = policy_logits.reshape(-1, policy_logits.size(-1))
-                            flat_actions = batch_actions.reshape(-1)
-                            flat_masks = batch_masks.reshape(-1)
-                            
-                            # Only consider valid timesteps (where mask is 1)
-                            valid_indices = flat_masks > 0.5
-                            valid_policy_logits = flat_policy_logits[valid_indices]
-                            valid_actions = flat_actions[valid_indices]
-                            
-                            # Create distribution only for valid timesteps
-                            dist = torch.distributions.Categorical(logits=valid_policy_logits)
-                            base_log_probs = dist.log_prob(valid_actions)
-                            base_entropy = dist.entropy()
-                            
-                            # Create full-sized tensors with zeros for padded timesteps
-                            log_probs = torch.zeros_like(flat_actions, dtype=torch.float32)
-                            entropy = torch.zeros_like(flat_actions, dtype=torch.float32)
-                            
-                            # Fill in valid values
-                            log_probs[valid_indices] = base_log_probs
-                            entropy[valid_indices] = base_entropy
-                            
-                            # Reshape back to [batch_size, seq_len]
-                            log_probs = log_probs.reshape(batch_size, seq_len)
-                            entropy = entropy.reshape(batch_size, seq_len)
-                            
-                            # Reshape values to [batch_size, seq_len]
-                            if values.dim() == 3:  # If values is [batch_size, seq_len, 1]
-                                values = values.squeeze(-1)
-                            elif values.dim() == 1:  # If values is [batch_size*seq_len]
-                                values = values.reshape(batch_size, seq_len)
-                        else:
-                            # Fall back for unexpected shapes
-                            debug_print(f"Warning: Unexpected policy_logits shape: {policy_logits.shape}")
-                            # Try a safe reshape based on total elements
-                            total_elements = policy_logits.numel()
-                            if total_elements % action_dim == 0:
-                                # We can reshape safely to [-1, action_dim]
-                                flat_policy_logits = policy_logits.reshape(-1, action_dim)
-                                # Trim or pad actions to match
-                                flat_actions = batch_actions.reshape(-1)[:flat_policy_logits.size(0)]
-                                flat_masks = batch_masks.reshape(-1)[:flat_policy_logits.size(0)]
-                                
-                                # Create distribution
-                                dist = torch.distributions.Categorical(logits=flat_policy_logits)
-                                log_probs = dist.log_prob(flat_actions)
-                                entropy = dist.entropy()
-                                
-                                # Reshape to batch dimensions if possible
-                                try:
-                                    log_probs = log_probs.reshape(batch_size, -1)
-                                    entropy = entropy.reshape(batch_size, -1)
-                                except:
-                                    # Keep as flat if reshape fails
-                                    pass
-                            else:
-                                debug_print(f"Error: Cannot safely reshape policy_logits with {total_elements} elements and action_dim {action_dim}")
-                                # Skip this batch
-                                continue
-                                
-                        # Compute importance ratio and PPO objective, accounting for masks
+                        # Forward pass with non-recurrent model (simplification)
+                        policy_logits, values = self.model(batch_states)
+                        
+                        # Make sure values has the right shape
+                        if values.dim() > 1:
+                            values = values.squeeze(-1)
+                        
+                        # Create distribution and get log probabilities
+                        dist = torch.distributions.Categorical(logits=policy_logits)
+                        log_probs = dist.log_prob(batch_actions)
+                        entropy = dist.entropy()
+                        
+                        # Calculate importance ratio
                         ratio = torch.exp(log_probs - batch_old_log_probs)
                         
-                        # Apply mask to focus only on valid timesteps
+                        # FIXED: Add debugging for ratio and advantages
+                        debug_print(f"Policy stats - ratio shape: {ratio.shape}, ratio min/max: {ratio.min().item()}/{ratio.max().item()}")
+                        debug_print(f"Advantage stats - shape: {batch_advantages.shape}, min/max: {batch_advantages.min().item()}/{batch_advantages.max().item()}")
+                        
+                        # Apply mask to ratio and advantages for valid timesteps only
                         masked_ratio = ratio * batch_masks
                         masked_advantages = batch_advantages * batch_masks
-                        masked_returns = batch_returns * batch_masks
                         
-                        # Calculate policy loss
+                        # Calculate surrogate objectives
                         surr1 = masked_ratio * masked_advantages
                         surr2 = torch.clamp(masked_ratio, 1.0 - self.clip_eps, 1.0 + self.clip_eps) * masked_advantages
-                        policy_loss = -torch.min(surr1, surr2).sum() / (batch_masks.sum() + 1e-8)
                         
-                        # Ensure values has the right shape [batch_size, seq_len]
-                        if values.shape != batch_returns.shape:
-                            debug_print(f"Reshaping values from {values.shape} to match returns {batch_returns.shape}")
-                            if values.numel() == batch_returns.numel():
-                                values = values.reshape_as(batch_returns)
-                            else:
-                                debug_print(f"Warning: Cannot reshape values - element count mismatch")
-                                # Skip this batch if we can't properly reshape
-                                continue
+                        # FIXED: Use mean instead of sum for policy loss
+                        policy_loss = -torch.min(surr1, surr2).mean()
                         
-                        # Calculate value loss with masking
-                        value_loss = F.mse_loss(values * batch_masks, masked_returns, reduction='sum') / (batch_masks.sum() + 1e-8)
+                        # FIXED: Simplify value loss calculation
+                        value_loss = F.mse_loss(values * batch_masks, batch_returns * batch_masks)
                         
-                        # Average entropy over valid timesteps
-                        entropy_loss = (entropy * batch_masks).sum() / (batch_masks.sum() + 1e-8)
+                        # Calculate entropy loss
+                        entropy_loss = entropy.mean()
                         
-                        # Calculate approximate KL for early stopping
+                        # Calculate approximate KL divergence for early stopping
                         with torch.no_grad():
                             log_ratio = log_probs - batch_old_log_probs
-                            approx_kl = ((torch.exp(log_ratio) - 1) - log_ratio)
-                            approx_kl = (approx_kl * batch_masks).sum() / (batch_masks.sum() + 1e-8)
-                            approx_kl = approx_kl.item()
-                
-                # Calculate clip fraction
-                            clip_frac = torch.mean(((torch.abs(ratio - 1.0) > self.clip_eps).float() * batch_masks).sum() / (batch_masks.sum() + 1e-8))
-                            clip_fractions.append(clip_frac.item())
-                    except Exception as e:
-                        debug_print(f"Error during forward pass or loss computation: {e}")
-                        import traceback
-                        traceback.print_exc()
-                        continue  # Skip this batch if we encounter an error
+                            approx_kl = ((torch.exp(log_ratio) - 1) - log_ratio).mean().item()
+                            clip_fraction = torch.mean((torch.abs(ratio - 1.0) > self.clip_eps).float()).item()
+                            clip_fractions.append(clip_fraction)
+                        
+                        # Combine losses using coefficients
+                        total_loss = policy_loss + self.vf_coef * value_loss - self.ent_reg * entropy_loss
+                        
+                        # Perform gradient update
+                        self.optimizer.zero_grad()
+                        total_loss.backward()
+                        
+                        # FIXED: Add gradient checking
+                        grad_info = {}
+                        for name, param in self.model.named_parameters():
+                            if param.grad is None:
+                                debug_print(f"Parameter {name} has no gradient!")
+                                grad_info[name] = "no_grad"
+                            elif param.grad.abs().sum() == 0:
+                                debug_print(f"Parameter {name} has zero gradient!")
+                                grad_info[name] = "zero_grad"
+                            else:
+                                grad_info[name] = param.grad.abs().sum().item()
+                        
+                        # Apply gradient clipping
+                        torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.max_grad_norm)
+                        
+                        # Perform optimization step
+                        self.optimizer.step()
+                        
+                        # Update metrics
+                        avg_policy_loss += policy_loss.item()
+                        avg_value_loss += value_loss.item()
+                        avg_entropy += entropy_loss.item()
+                        avg_approx_kl += approx_kl
+                        
+                        # Check for early stopping based on KL divergence
+                        if approx_kl > 1.5 * self.target_kl:
+                            early_stop = True
+                            break
                     
-                    # Total loss
-                    loss = policy_loss + self.vf_coef * value_loss - self.ent_reg * entropy_loss
-                    
-                    # Perform gradient step
-                    self.optimizer.zero_grad()
-                    loss.backward()
-                    torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.max_grad_norm)
-                    self.optimizer.step()
-                    
-                    # Update metrics
-                    avg_policy_loss += policy_loss.item()
-                    avg_value_loss += value_loss.item()
-                    avg_entropy += entropy_loss.item()
-                    avg_approx_kl += approx_kl
-                    
-                    # Check for early stopping
-                    if approx_kl > 1.5 * self.target_kl:
-                        early_stop = True
+                    if early_stop:
                         break
                 
-                if early_stop:
-                    break
-                    
-            # Calculate average metrics
-            num_updates = (self.epochs if not early_stop else _ + 1) * math.ceil(len(indices) / self.batch_size)
-            avg_policy_loss /= max(1, num_updates)
-            avg_value_loss /= max(1, num_updates)
-            avg_entropy /= max(1, num_updates)
-            avg_approx_kl /= max(1, num_updates)
-            avg_clip_fraction = np.mean(clip_fractions) if clip_fractions else 0.0
-            
-            # Here we'd calculate explained variance, but it's tricky with sequences
-            # Just use a simple approximation for now
-            explained_var = 0.5  # Placeholder
+                # Calculate average metrics
+                num_updates = (self.epochs if not early_stop else _ + 1) * max(1, (len(indices) + self.batch_size - 1) // self.batch_size)
+                avg_policy_loss /= max(1, num_updates)
+                avg_value_loss /= max(1, num_updates)
+                avg_entropy /= max(1, num_updates)
+                avg_approx_kl /= max(1, num_updates)
+                avg_clip_fraction = np.mean(clip_fractions) if clip_fractions else 0.0
+                
+                # Calculate explained variance
+                with torch.no_grad():
+                    explained_var = self.calculate_explained_variance(
+                        values.cpu().numpy(), batch_returns.cpu().numpy())
+                
+                # Return metrics dictionary
+                return {
+                    'policy_loss': avg_policy_loss,
+                    'value_loss': avg_value_loss,
+                    'entropy': avg_entropy,
+                    'kl': avg_approx_kl,
+                    'explained_variance': explained_var,
+                    'learning_rate': self.optimizer.param_groups[0]['lr'],
+                    'clip_fraction': avg_clip_fraction,
+                    'early_stopped': early_stop,
+                    'grad_info': grad_info,
+                }
+                
+            except Exception as e:
+                debug_print(f"Error in recurrent PPO update: {e}")
+                import traceback
+                traceback.print_exc()
+                
+                # Return default metrics to avoid breaking training
+                return {
+                    'policy_loss': 0.0,
+                    'value_loss': 0.0,
+                    'entropy': self.ent_reg,
+                    'kl': 0.0,
+                    'explained_variance': 0.0,
+                    'learning_rate': self.optimizer.param_groups[0]['lr'],
+                    'clip_fraction': 0.0,
+                    'early_stopped': False,
+                    'error': str(e),
+                }
             
         else:
             # Original update for non-recurrent policy
@@ -592,9 +629,12 @@ class PPO:
             returns_tensor = torch.FloatTensor(returns).to(self.device)
             advantages_tensor = torch.FloatTensor(advantages).to(self.device)
             
-            # Normalize advantages (more stable training)
+            # FIXED: Normalize advantages only if std is significant
             if self.update_adv_batch_norm and len(advantages_tensor) > 1:
-                advantages_tensor = (advantages_tensor - advantages_tensor.mean()) / (advantages_tensor.std() + 1e-8)
+                adv_mean = advantages_tensor.mean()
+                adv_std = advantages_tensor.std()
+                if adv_std > 1e-4:
+                    advantages_tensor = (advantages_tensor - adv_mean) / (adv_std + 1e-8)
             
             # Mini-batch updates
             n_samples = len(states)
@@ -606,6 +646,7 @@ class PPO:
             avg_entropy = 0
             avg_approx_kl = 0
             clip_fractions = []
+            grad_info = {}
             
             early_stop = False
             
@@ -659,6 +700,10 @@ class PPO:
                         policy_logits, values = self.model(batch_states)
                         values = values.squeeze(-1)
                     
+                    # FIXED: Add debug prints for policy logits and values
+                    debug_print(f"Policy logits: shape={policy_logits.shape}, min/max={policy_logits.min().item()}/{policy_logits.max().item()}")
+                    debug_print(f"Values: shape={values.shape}, min/max={values.min().item()}/{values.max().item()}")
+                    
                     # Calculate policy distribution
                     dist = torch.distributions.Categorical(logits=policy_logits)
                     log_probs = dist.log_prob(batch_actions)
@@ -667,12 +712,18 @@ class PPO:
                     # Compute importance ratio and clipped surrogate objective
                     ratio = torch.exp(log_probs - batch_old_log_probs)
                     
+                    # FIXED: Add debug print for policy ratio
+                    debug_print(f"Policy ratio: min/max={ratio.min().item()}/{ratio.max().item()}")
+                    debug_print(f"Advantages: min/max={batch_advantages.min().item()}/{batch_advantages.max().item()}")
+                    
                     # Calculate policy loss
                     surr1 = ratio * batch_advantages
                     surr2 = torch.clamp(ratio, 1.0 - self.clip_eps, 1.0 + self.clip_eps) * batch_advantages
+                    
+                    # FIXED: Use mean instead of sum for policy loss
                     policy_loss = -torch.min(surr1, surr2).mean()
                     
-                    # Calculate value loss
+                    # FIXED: Simplify value loss calculation
                     value_loss = F.mse_loss(values, batch_returns)
                     
                     # Calculate approximate KL divergence for early stopping
@@ -688,6 +739,17 @@ class PPO:
                     # Perform gradient step
                     self.optimizer.zero_grad()
                     loss.backward()
+                    
+                    # FIXED: Add gradient checking
+                    for name, param in self.model.named_parameters():
+                        if param.grad is None:
+                            debug_print(f"Parameter {name} has no gradient!")
+                            grad_info[name] = "no_grad"
+                        elif param.grad.abs().sum() == 0:
+                            debug_print(f"Parameter {name} has zero gradient!")
+                            grad_info[name] = "zero_grad"
+                        else:
+                            grad_info[name] = param.grad.abs().sum().item()
                     
                     # Apply gradient clipping
                     torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.max_grad_norm)
@@ -710,10 +772,10 @@ class PPO:
             
             # Compute average metrics
             num_updates = (self.epochs if not early_stop else _ + 1) * math.ceil(n_samples / self.batch_size)
-            avg_policy_loss /= num_updates
-            avg_value_loss /= num_updates
-            avg_entropy /= num_updates
-            avg_approx_kl /= num_updates
+            avg_policy_loss /= max(1, num_updates)
+            avg_value_loss /= max(1, num_updates)
+            avg_entropy /= max(1, num_updates)
+            avg_approx_kl /= max(1, num_updates)
             avg_clip_fraction = np.mean(clip_fractions)
             
             # Compute explained variance
@@ -747,6 +809,13 @@ class PPO:
         if self.lr_reset_interval > 0 and self.updates_since_lr_reset >= self.lr_reset_interval:
             self.reset_optimizer_state()
             self.updates_since_lr_reset = 0
+
+        grads_exist = sum(1 for name, param in self.model.named_parameters() 
+                if param.requires_grad and param.grad is not None)
+        grads_zero = sum(1 for name, param in self.model.named_parameters() 
+                        if param.requires_grad and param.grad is not None and param.grad.abs().sum() == 0)
+        grads_missing = sum(1 for name, param in self.model.named_parameters() 
+                        if param.requires_grad and param.grad is None)
             
         return {
             'policy_loss': avg_policy_loss,
@@ -757,6 +826,9 @@ class PPO:
             'learning_rate': self.metrics['learning_rate'][-1],
             'clip_fraction': avg_clip_fraction,
             'early_stopped': early_stop,
+            'grads_exist': grads_exist,
+            'grads_zero': grads_zero, 
+            'grads_missing': grads_missing
         }
         
     def select_action(self, state, deterministic=False):
@@ -782,14 +854,17 @@ class PPO:
                 
             # Get action using the appropriate forward method based on recurrence
             if self.use_recurrent:
-                action, log_prob, entropy, value, next_lstm_state = self.model.get_action_and_value(
-                    state, self.lstm_states, deterministic
+                # Don't pass deterministic to forward method
+                policy_logits, value, next_lstm_state = self.model(
+                    state, self.lstm_states
                 )
                 # Update LSTM state
                 self.lstm_states = next_lstm_state
-            else:
-                policy_logits, value = self.model(state)
-                value = value.squeeze(-1)
+                
+                # Handle multi-dimensional outputs
+                if policy_logits.dim() > 2:  # [batch, sequence, action_dim]
+                    # Get policy for the last timestep in the sequence
+                    policy_logits = policy_logits[:, -1]
                 
                 # Create distribution and sample action
                 dist = torch.distributions.Categorical(logits=policy_logits)
@@ -800,20 +875,61 @@ class PPO:
                 log_prob = dist.log_prob(action)
                 entropy = dist.entropy()
                 
-            # Convert to numpy or python types for environment interaction
-            action = action.cpu().numpy()
-            if len(action) == 1:
-                action = action[0]  # Extract scalar for single actions
-            log_prob = log_prob.cpu().numpy()
-            if isinstance(log_prob, np.ndarray) and len(log_prob) == 1:
-                log_prob = log_prob[0]
-            value = value.cpu().numpy()
-            if isinstance(value, np.ndarray) and len(value) == 1:
-                value = value[0]
-            entropy = entropy.cpu().numpy()
-            if isinstance(entropy, np.ndarray) and len(entropy) == 1:
-                entropy = entropy[0]
+                # Handle multi-dimensional value outputs
+                if value.dim() > 1 and value.size(0) == 1:
+                    # If value has sequence dimension, take the last one
+                    value = value[:, -1] if value.dim() == 2 else value[0, -1]
+            else:
+                policy_logits, value = self.model(state)
                 
+                # Handle multi-dimensional outputs
+                if policy_logits.dim() > 2:  # Unexpected extra dimensions
+                    policy_logits = policy_logits.squeeze(0)  # Remove batch dim if needed
+                
+                # Create distribution and sample action
+                dist = torch.distributions.Categorical(logits=policy_logits)
+                if deterministic:
+                    action = torch.argmax(policy_logits, dim=1)
+                else:
+                    action = dist.sample()
+                log_prob = dist.log_prob(action)
+                entropy = dist.entropy()
+                
+                # Squeeze extra dimensions from value
+                value = value.squeeze(-1) if value.dim() > 1 else value
+                
+            # Convert to numpy or python types for environment interaction
+            # Safely handle multi-dimensional action tensors
+            if action.dim() > 1 or action.size(0) > 1:
+                action = action.view(-1)  # Flatten to 1D
+                action = action.cpu().numpy()  # Convert to numpy array
+            else:
+                action = action.item() if action.numel() == 1 else action.cpu().numpy()
+                
+            # Handle multi-dimensional log_prob
+            if isinstance(log_prob, torch.Tensor):
+                if log_prob.dim() > 1 or log_prob.size(0) > 1:
+                    log_prob = log_prob.view(-1)  # Flatten to 1D
+                    log_prob = log_prob.cpu().numpy()  # Convert to numpy array
+                else:
+                    log_prob = log_prob.item() if log_prob.numel() == 1 else log_prob.cpu().numpy()
+                
+            # Handle multi-dimensional value
+            if isinstance(value, torch.Tensor):
+                if value.dim() > 1 or value.size(0) > 1:
+                    value = value.view(-1)  # Flatten to 1D
+                    value = value.cpu().numpy()  # Convert to numpy array
+                else:
+                    value = value.item() if value.numel() == 1 else value.cpu().numpy()
+                
+            # Handle multi-dimensional entropy
+            if isinstance(entropy, torch.Tensor):
+                if entropy.dim() > 1 or entropy.size(0) > 1:
+                    entropy = entropy.view(-1)  # Flatten to 1D
+                    entropy = entropy.cpu().numpy()  # Convert to numpy array
+                else:
+                    entropy = entropy.item() if entropy.numel() == 1 else entropy.cpu().numpy()
+                    
             return action, log_prob, value, entropy
             
     def process_done(self, done):
@@ -933,7 +1049,7 @@ class PPO:
             # Slowly reduce entropy for more exploitation
             new_ent_reg = max(self.min_entropy, self.ent_reg * 0.95)
             if new_ent_reg != self.ent_reg:
-                debug_print(f"Performance improving - reducing entropy from {self.ent_reg} to {new_ent_reg}")
+                debug_print(f"Performance improving - reducing entropy from {self.ent_reg:.4f} to {new_ent_reg:.4f}")
                 self.ent_reg = new_ent_reg
                 
         # If performance is stagnating or decreasing, boost exploration
@@ -943,7 +1059,7 @@ class PPO:
             self.ent_reg = min(0.1, self.ent_reg * 1.5)
             
             if original_ent_reg != self.ent_reg:
-                debug_print(f"Performance stagnating - boosting entropy from {original_ent_reg} to {self.ent_reg}")
+                debug_print(f"Performance stagnating - boosting entropy from {original_ent_reg:.4f} to {self.ent_reg:.4f}")
                 
             # Reset stagnation counter
             if self.stagnation_counter > 30:

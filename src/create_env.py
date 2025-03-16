@@ -1,3 +1,6 @@
+# Import the numpy patch first to fix np.bool deprecation
+from src.np_patch import *
+
 from obstacle_tower_env import ObstacleTowerEnv
 import os
 import time

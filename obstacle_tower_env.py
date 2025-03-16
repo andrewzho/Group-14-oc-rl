@@ -209,17 +209,27 @@ class ObstacleTowerEnv(gym.Env):
         return obs
 
     def step(self, action):
+        """Run one timestep of the environment's dynamics. When end of
+        episode is reached, you are responsible for calling `reset()`
+        to reset this environment's state.
+        Accepts an action and returns a tuple (observation, reward, done, info).
+        In the case of multi-agent environments, these are lists.
+        Args:
+            action (object/list): an action provided by the environment
+        Returns:
+            observation (object/list): agent's observation of the current environment
+            reward (float/list) : amount of reward returned after previous action
+            done (boolean/list): whether the episode has ended.
+            info (dict): contains auxiliary diagnostic information, including BrainInfo.
         """
-        Run agent-selected action within the environment.
-        Returns: observation, reward, done, info
-        """
-        # Convert to numpy array if it's a list (for vectorized environments)
-        if isinstance(action, list):
-            action = np.array(action)
-        
+
+        # Use random actions for all other agents in environment.
+        if self._flattener is not None:
+            # Translate action into list
+            action = np.array(self._flattener.lookup_action(action))
+
         self._env.set_actions(self.behavior_name, action.reshape([1, -1]))
         self._env.step()
-        
         running_info, terminal_info = self._env.get_steps(self.behavior_name)
         obs, reward, done, info = self._single_step(running_info, terminal_info)
         self.game_over = done

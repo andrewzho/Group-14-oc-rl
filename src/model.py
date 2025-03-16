@@ -65,11 +65,6 @@ class SpatialAttention(nn.Module):
         return x * attention_map
 
 class RecurrentPPONetwork(nn.Module):
-    """
-    PPO Network with LSTM for memory retention across time steps.
-    This architecture enhances the agent's ability to remember key locations,
-    door positions, and navigation paths over longer time horizons.
-    """
     def __init__(self, input_shape, num_actions, lstm_hidden_size=256, use_lstm=True):
         super(RecurrentPPONetwork, self).__init__()
         # Input shape is (12, 84, 84) for 4 stacked frames (4 * 3 channels)
@@ -79,14 +74,16 @@ class RecurrentPPONetwork(nn.Module):
             nn.Conv2d(32, 64, kernel_size=4, stride=2),  # [32, 20, 20] -> [64, 9, 9]
             nn.ReLU(),
             ResidualBlock(64),  # Add residual block for better gradient flow
-            ChannelAttention(64),  # Add attention to focus on important features
+            ChannelAttention(64, reduction=8),  # Enhanced attention with stronger reduction
             SpatialAttention(kernel_size=5),  # Add spatial attention
             nn.Conv2d(64, 64, kernel_size=3, stride=1),  # [64, 9, 9] -> [64, 7, 7]
             nn.ReLU(),
             ResidualBlock(64),  # Another residual block
-            ChannelAttention(64),  # Add attention
+            ChannelAttention(64, reduction=8),  # Enhanced attention
             SpatialAttention(kernel_size=3),  # Add spatial attention with smaller kernel
             nn.Conv2d(64, 128, kernel_size=3, stride=1),  # [64, 7, 7] -> [128, 5, 5]
+            nn.ReLU(),
+            nn.Conv2d(128, 128, kernel_size=1, stride=1),  # Extra 1x1 conv for more features
             nn.ReLU(),
             nn.Flatten()  # [128, 5, 5] -> [3200]
         )
@@ -100,15 +97,17 @@ class RecurrentPPONetwork(nn.Module):
             # Compress CNN features before LSTM to reduce parameters
             self.feature_compressor = nn.Sequential(
                 nn.Linear(conv_out_size, 512),
-                nn.ReLU()
+                nn.ReLU(),
+                nn.LayerNorm(512)  # Add layer norm before LSTM
             )
             
-            # LSTM layer for temporal memory
+            # LSTM layer with increased complexity
             self.lstm = nn.LSTM(
                 input_size=512,
                 hidden_size=lstm_hidden_size,
-                num_layers=1,
-                batch_first=True
+                num_layers=2,  # Increased to 2 layers for more memory capacity
+                batch_first=True,
+                dropout=0.1  # Add dropout for regularization
             )
             
             # Feature projection after LSTM
@@ -123,15 +122,19 @@ class RecurrentPPONetwork(nn.Module):
                 nn.Linear(512, 256),
                 nn.ReLU(),
                 nn.Dropout(0.1),
-                nn.Linear(256, num_actions)
+                nn.Linear(256, 128),  # Added extra layer for more capacity
+                nn.ReLU(),
+                nn.Linear(128, num_actions)
             )
             
-            # Value stream uses LSTM outputs
+            # Value stream uses LSTM outputs with more capacity
             self.value_stream = nn.Sequential(
                 nn.Linear(512, 256),
                 nn.ReLU(),
                 nn.Dropout(0.1),
-                nn.Linear(256, 1)
+                nn.Linear(256, 128),  # Added extra layer
+                nn.ReLU(),
+                nn.Linear(128, 1)
             )
         else:
             # Original architecture without LSTM (for backward compatibility)
@@ -203,11 +206,13 @@ class RecurrentPPONetwork(nn.Module):
         if device is None:
             device = next(self.parameters()).device
             
-        h0 = torch.zeros(1, batch_size, self.lstm_hidden_size, device=device)
-        c0 = torch.zeros(1, batch_size, self.lstm_hidden_size, device=device)
+        # Create hidden states matching the number of LSTM layers (2)
+        num_layers = 2  # Match the num_layers parameter in the LSTM constructor
+        h0 = torch.zeros(num_layers, batch_size, self.lstm_hidden_size, device=device)
+        c0 = torch.zeros(num_layers, batch_size, self.lstm_hidden_size, device=device)
         return (h0, c0)
-
-    def forward(self, x, lstm_state=None, episode_starts=None):
+    
+    def forward(self, x, lstm_state=None, episode_starts=None, sequence_length=None):
         """
         Forward pass through the network.
         
@@ -216,6 +221,7 @@ class RecurrentPPONetwork(nn.Module):
                [batch_size, sequence_length, channels, height, width] if using LSTM
             lstm_state: Optional tuple of (h0, c0) for LSTM hidden and cell states
             episode_starts: Boolean tensor indicating which environments are starting new episodes
+            sequence_length: The length of sequences for processing (for LSTM)
             
         Returns:
             policy_logits: Action logits
@@ -225,14 +231,25 @@ class RecurrentPPONetwork(nn.Module):
         # Handle input dimensionality
         batch_size = x.size(0)
         original_shape = x.shape
-        sequence_length = 1  # Default for non-sequence inputs
+        seq_len = 1  # Default for non-sequence inputs
         
         # Use debug_print instead of print
         try:
-            debug_print(f"Forward input shape: {x.shape}, ep_starts: {episode_starts}")
+            debug_print(f"Forward input shape: {x.shape}, ep_starts: {episode_starts}, seq_length: {sequence_length}")
         except:
             pass  # Debug print might not be defined
         
+        # Use provided sequence_length if available
+        if sequence_length is not None:
+            # Store the sequence_length as an attribute for future reference
+            self.sequence_length = sequence_length
+        elif hasattr(self, 'sequence_length'):
+            # Use previously stored sequence_length
+            sequence_length = self.sequence_length
+        else:
+            # Default sequence length is 1
+            sequence_length = 1
+            
         # Handle different input formats
         if x.dim() == 5 and self.use_lstm:
             # Input is [batch_size, sequence_length, channels, height, width]
@@ -240,10 +257,9 @@ class RecurrentPPONetwork(nn.Module):
             seq_len = x.size(1)
             sequence_length = seq_len
             x = x.view(batch_size * seq_len, *x.shape[2:])
-        elif x.dim() == 4 and self.use_lstm and hasattr(self, 'sequence_length') and self.sequence_length > 1:
+        elif x.dim() == 4 and self.use_lstm and sequence_length > 1:
             # Input is [batch_size, channels, height, width] but we need to treat it as a sequence
             # We'll repeat the same input for the sequence (used when we don't have actual sequence data)
-            sequence_length = getattr(self, 'sequence_length', 1)
             x = x.unsqueeze(1).expand(-1, sequence_length, -1, -1, -1)
             x = x.reshape(batch_size * sequence_length, *x.shape[2:])
         elif x.dim() == 3:
