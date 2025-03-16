@@ -115,6 +115,7 @@ def make_env(env_path=None, worker_id=1, realtime_mode=False, config=None, no_gr
     def _init():
         # Import the memory-efficient wrapper
         from src.envs.memory_efficient_wrapper import create_memory_efficient_env
+        from src.envs.wrappers import GymVersionBridge
         
         # Create memory-efficient environment
         env = create_memory_efficient_env(
@@ -123,6 +124,9 @@ def make_env(env_path=None, worker_id=1, realtime_mode=False, config=None, no_gr
             stack_frames=config["stack_frames"],
             seed=config["seed"]
         )
+        
+        # Wrap the environment with GymVersionBridge
+        env = GymVersionBridge(env)
         
         return env
     
@@ -147,20 +151,9 @@ def preprocess_obstacle_tower(env, stack_frames=4, grayscale=True, new_size=(84,
     return env
 
 
-def create_env_with_custom_wrappers(env_fn, config, use_reward_shaping=True, frame_skip=4, max_steps=1000):
-    """
-    Create environment with custom wrappers from src.envs.wrappers
-    
-    Args:
-        env_fn: Function that creates the base environment
-        config: Environment configuration
-        use_reward_shaping: Whether to enable reward shaping
-        frame_skip: Number of frames to skip (action repeat)
-        max_steps: Maximum steps per episode
-        
-    Returns:
-        VecTransposeImage: Preprocessed vectorized environment
-    """
+def create_env_with_custom_wrappers(env_fn, config, use_reward_shaping=True, frame_skip=4, max_steps=1000,
+                                  record=False, video_dir=None, video_length=3000):
+    """Create environment with custom wrappers"""
     # Create base environment
     env = env_fn()
     
@@ -178,10 +171,11 @@ def create_env_with_custom_wrappers(env_fn, config, use_reward_shaping=True, fra
     )
     
     # Vectorize for stable-baselines compatibility
+    from stable_baselines3.common.vec_env import DummyVecEnv
     env = DummyVecEnv([lambda: env])
     
-    # Transpose for PyTorch (channel first)
-    env = VecTransposeImage(env)
+    # Skip VecTransposeImage - our observations are already in the right format
+    # or our observation space is not compatible with it
     
     return env
 
@@ -332,16 +326,12 @@ def main():
 
         # Add additional network settings if using custom network
         if args.network != "cnn":
-            print(f"Using custom {args.network} network architecture")
-            from src.models.networks import create_feature_extractor
+            # Import feature extractor classes directly
+            from src.models.networks import feature_extractors
             
             # Set up custom feature extractor
-            policy_kwargs["features_extractor_class"] = lambda obs_space: create_feature_extractor(
-                args.network, 
-                obs_space,
-                features_dim=NETWORK_CONFIG["hidden_dim"]
-            )
-            policy_kwargs["features_extractor_kwargs"] = {}  # Empty dict since we pass params directly above
+            policy_kwargs["features_extractor_class"] = feature_extractors[args.network]
+            policy_kwargs["features_extractor_kwargs"] = {"features_dim": NETWORK_CONFIG["hidden_dim"]}
             
             # Special handling for LSTM networks
             if args.network == "lstm":
@@ -430,7 +420,19 @@ def main():
     print(f"- Demonstrations: {'Disabled' if args.no_demos else 'Enabled'}")
     print(f"- Random Network Distillation: {'Disabled' if args.no_rnd else 'Enabled'}")
     print(f"- Training Timesteps: {args.timesteps}")
+    print(f"- Buffer Size: {SAC_CONFIG['buffer_size']}")
+    print(f"- Learning Starts: {SAC_CONFIG['learning_starts']}")
+    print(f"- Batch Size: {SAC_CONFIG['batch_size']}")
+    print(f"- Learning Rate: {SAC_CONFIG['learning_rate']}")
+    print(f"- Gamma: {SAC_CONFIG['gamma']}")
+    print(f"- Tau: {SAC_CONFIG['tau']}")
     print()
+    
+    # Create progress tracking variables
+    last_eval_reward = float('-inf')
+    best_eval_reward = float('-inf')
+    patience = 5  # Number of evaluations without improvement before early stopping
+    patience_counter = 0
     
     # Train the agent
     print(f"Starting training for {args.timesteps} timesteps...")
@@ -442,16 +444,18 @@ def main():
     
     # Save the final model
     final_model_path = os.path.join(model_path, "final_model")
-    print(f"Saving final model to {final_model_path}")
+    print(f"\nTraining completed!")
+    print(f"Best evaluation reward: {best_eval_reward:.2f}")
+    print(f"Final model saved to: {final_model_path}")
     model.save(final_model_path)
     
     # Save the final demonstration buffer
     if not args.no_demos and demo_buffer is not None:
         final_demo_path = os.path.join(model_path, "final_demonstrations.pkl")
-        print(f"Saving final demonstration buffer to {final_demo_path}")
+        print(f"Final demonstration buffer saved to: {final_demo_path}")
         demo_buffer.save(final_demo_path)
     
-    print("Training completed successfully!")
+    print("\nTraining completed successfully!")
 
 
 if __name__ == "__main__":

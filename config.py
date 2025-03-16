@@ -32,14 +32,14 @@ ENV_CONFIG = {
 # SAC hyperparameters
 SAC_CONFIG = {
     "policy_type": "CnnPolicy",
-    "learning_rate": 3e-4,
-    "buffer_size": 10000,  # Reduced from 100000 to 10000
-    "learning_starts": 1000,
-    "batch_size": 256,
-    "tau": 0.005,
+    "learning_rate": 1e-3,  # Increased from 3e-4 to 1e-3 for faster learning
+    "buffer_size": 1000000,
+    "learning_starts": 10000,  # Reduced to start learning earlier
+    "batch_size": 512,  # Increased from 256 to 512 for better stability
+    "tau": 0.01,  # Increased from 0.005 for faster target network updates
     "gamma": 0.99,
     "train_freq": 1,
-    "gradient_steps": 1,
+    "gradient_steps": 2,  # Increased from 1 to 2 for more training per step
     "ent_coef": "auto",
     "target_update_interval": 1,
     "target_entropy": "auto",
@@ -88,10 +88,10 @@ EVAL_CONFIG = {
 # Neural network architecture
 NETWORK_CONFIG = {
     "cnn_features": [
-        {"in_channels": 4, "out_channels": 32, "kernel_size": 8, "stride": 4},
-        {"in_channels": 32, "out_channels": 64, "kernel_size": 4, "stride": 2},
-        {"in_channels": 64, "out_channels": 64, "kernel_size": 3, "stride": 1},
+        {"in_channels": 4, "out_channels": 64, "kernel_size": 8, "stride": 4},  # Increased channels
+        {"in_channels": 64, "out_channels": 128, "kernel_size": 4, "stride": 2},  # Increased channels
+        {"in_channels": 128, "out_channels": 128, "kernel_size": 3, "stride": 1},  # Increased channels
     ],
-    "hidden_dim": 512,  # Hidden dimension of fully connected layers
-    "latent_dim": 256,  # Latent dimension for actor/critic networks
+    "hidden_dim": 1024,  # Increased from 512 to 1024
+    "latent_dim": 512,  # Increased from 256 to 512
 }

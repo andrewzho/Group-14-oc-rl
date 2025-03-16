@@ -447,7 +447,7 @@ class DemoSAC(SAC):
 
 class RNDUpdateCallback(BaseCallback):
     """
-    Callback for updating the RND model during training.
+    Callback to handle RND model updates during training.
     """
     
     def __init__(
@@ -471,66 +471,27 @@ class RNDUpdateCallback(BaseCallback):
     
     def _on_step(self) -> bool:
         """
-        Update RND model every update_freq steps.
-        
-        Returns:
-            bool: Whether to continue training
+        Check if we should update the RND model based on frequency
         """
-        if self.num_timesteps % self.update_freq == 0 and self.rnd_model is not None:
-            # Sample observations from replay buffer
-            if hasattr(self.model, "replay_buffer"):
-                # Check if buffer has any data - use a different approach than len()
-                # In some versions, we can use buffer.pos or buffer.size
-                buffer_has_data = False
-                if hasattr(self.model.replay_buffer, "pos"):
-                    buffer_has_data = self.model.replay_buffer.pos > 0
-                elif hasattr(self.model.replay_buffer, "size"):
-                    buffer_has_data = self.model.replay_buffer.size > 0
-                elif hasattr(self.model.replay_buffer, "buffer_size"):
-                    # Assume we have data if buffer exists and we've taken steps
-                    buffer_has_data = self.num_timesteps > 0
-                
-                if buffer_has_data:
-                    # Get random batch of observations - use sample() method if it exists
-                    # otherwise, directly access the buffer
-                    if hasattr(self.model.replay_buffer, "sample"):
-                        # Use the sample method with a batch size of 64
-                        batch = self.model.replay_buffer.sample(64)
-                        obs = batch[0]  # Observations are typically the first element
-                    else:
-                        # Direct access to buffer - this is a fallback that might not work
-                        # with all versions, but worth trying
-                        try:
-                            # Try to get observations from the buffer
-                            # This assumes the buffer has an observations attribute
-                            if hasattr(self.model.replay_buffer, "observations"):
-                                # Get up to 64 observations or as many as available
-                                end_idx = min(64, self.model.replay_buffer.pos)
-                                obs = self.model.replay_buffer.observations[:end_idx]
-                            else:
-                                # If we can't access observations, just return True
-                                # to continue training
-                                return True
-                        except Exception as e:
-                            # If anything goes wrong, log error and continue
-                            if self.verbose > 0:
-                                print(f"Error accessing replay buffer: {e}")
-                            return True
+        if self.n_calls % self.update_freq == 0 and self.model.rnd_model is not None:
+            # Get a batch of observations from replay buffer
+            replay_data = self.model.replay_buffer.sample(self.model.batch_size)
+            obs = replay_data.observations
+            
+            # Convert observation to tensor and ensure it's on the correct device
+            if isinstance(obs, torch.Tensor):
+                # If already a tensor, just ensure it's on the right device
+                obs_tensor = obs.to(self.model.device)
+            else:
+                # If not a tensor, convert it to one
+                obs_tensor = torch.FloatTensor(obs).to(self.model.device)
+            
+            # Update RND model
+            update_info = self.model.rnd_model.update(obs_tensor)
+            
+            # Log update metrics
+            if self.verbose > 0 and hasattr(self.model, "logger"):
+                for k, v in update_info.items():
+                    self.model.logger.record(f"rnd/{k}", v)
                     
-                    # Convert to tensor
-                    obs_tensor = torch.FloatTensor(obs).to(self.model.device)
-                    
-                    # Update RND model
-                    rnd_loss = self.rnd_model.update(obs_tensor)
-                    
-                    # Log loss
-                    self.rnd_losses.append(rnd_loss["rnd_loss"])
-                    
-                    if self.verbose > 1:
-                        print(f"Updated RND model, loss: {rnd_loss['rnd_loss']:.4f}")
-                    
-                    # Log to tensorboard if available
-                    if self.logger is not None:
-                        self.logger.record("train/rnd_loss", rnd_loss["rnd_loss"])
-        
         return True

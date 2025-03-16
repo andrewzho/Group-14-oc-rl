@@ -356,7 +356,7 @@ def main():
     """Main function to convert demonstrations"""
     parser = argparse.ArgumentParser(description="Convert demonstration data to DemonstrationBuffer format")
     parser.add_argument("--input", type=str, default="raw_demos", help="Directory containing demonstration folders")
-    parser.add_argument("--output", type=str, default="demonstrations/demonstrations.pkl", help="Output file path")
+    parser.add_argument("--output", type=str, default="demonstrations/demonstrations1.pkl", help="Output file path")
     parser.add_argument("--resize", type=str, default="84,84", help="Resize observations to height,width")
     parser.add_argument("--retro", action="store_true", help="Use retro format (uint8, 0-255 range)")
     parser.add_argument("--batch-size", type=int, default=100, help="Batch size for processing")

@@ -15,22 +15,59 @@ import cv2
 from collections import deque
 
 
+class GymVersionBridge(gym.Wrapper):
+    """Compatibility wrapper to handle different Gym API versions"""
+    
+    def reset(self, **kwargs):
+        """Bridge between old and new Gym reset API"""
+        try:
+            # Try new API (returns obs, info)
+            result = self.env.reset(**kwargs)
+            if isinstance(result, tuple) and len(result) == 2:
+                return result
+            else:
+                # Old API returned just obs
+                return result, {}
+        except ValueError as e:
+            if "too many values to unpack" in str(e):
+                # Handle case where env uses new API but caller expects old
+                obs = self.env.reset(**kwargs)[0]
+                return obs
+            raise
+
 class GrayscaleWrapper(gym.ObservationWrapper):
     """
     Converts RGB observations to grayscale to reduce dimensionality.
     """
     def __init__(self, env):
         super().__init__(env)
-        # Update observation space
-        assert len(self.observation_space.shape) == 3 and self.observation_space.shape[2] in [1, 3]
-        self.observation_space = spaces.Box(
-            low=0, high=255, 
-            shape=(self.observation_space.shape[0], self.observation_space.shape[1], 1), 
-            dtype=np.uint8
-        )
+        
+        # Handle various observation formats
+        obs_shape = self.observation_space.shape
+        
+        # Check for existing frame stacking or unusual shapes
+        if len(obs_shape) == 3:
+            if obs_shape[2] > 4:  # Likely already processed/stacked
+                # Just pass through if already processed
+                self.process = False
+                return
+            else:
+                self.process = True
+                # Update observation space for normal case
+                self.observation_space = spaces.Box(
+                    low=0, high=255, 
+                    shape=(obs_shape[0], obs_shape[1], 1), 
+                    dtype=np.uint8
+                )
+        else:
+            # Unsupported shape, just pass through
+            self.process = False
     
     def observation(self, observation):
-        """Convert to grayscale"""
+        """Convert to grayscale if needed"""
+        if not self.process:
+            return observation
+            
         if observation.shape[2] == 1:
             return observation  # Already grayscale
         
@@ -80,8 +117,15 @@ class FrameStackWrapper(gym.Wrapper):
             dtype=np.uint8
         )
     
-    def reset(self):
+    def reset(self, **kwargs):
         """Reset environment and frame stack"""
+        result = self.env.reset(**kwargs)
+    
+        # Handle both old and new Gym API
+        if isinstance(result, tuple) and len(result) == 2:
+            obs, info = result
+        else:
+            obs, info = result, {}
         observation = self.env.reset()
         for _ in range(self.n_frames):
             self.frames.append(observation.copy())
@@ -135,8 +179,15 @@ class RewardShapingWrapper(gym.RewardWrapper):
         self.last_position = None
     
     def reset(self, **kwargs):
+        
         """Reset tracked state"""
-        obs = self.env.reset(**kwargs)
+        result = self.env.reset(**kwargs)
+    
+        # Handle both old and new Gym API
+        if isinstance(result, tuple) and len(result) == 2:
+            obs, info = result
+        else:
+            obs, info = result, {}
         self.last_floor = 0
         self.last_keys = 0
         self.last_doors = 0
@@ -236,7 +287,13 @@ class InfoLoggerWrapper(gym.Wrapper):
         
     def reset(self, **kwargs):
         """Reset counters for new episode"""
-        obs = self.env.reset(**kwargs)
+        result = self.env.reset(**kwargs)
+    
+        # Handle both old and new Gym API
+        if isinstance(result, tuple) and len(result) == 2:
+            obs, info = result
+        else:
+            obs, info = result, {}
         
         # Log completed episode info
         if self.step_counter > 0:

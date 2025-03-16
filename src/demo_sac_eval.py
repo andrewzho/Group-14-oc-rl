@@ -240,8 +240,11 @@ def evaluate_agent(model, env, n_episodes=5, deterministic=True, render=False, m
     keys_collected = []
     doors_opened = []
     time_per_step = []
+    episode_success = []  # Track if episode reached next floor
+    episode_efficiency = []  # Track reward per step
     
-    print(f"Evaluating agent for {n_episodes} episodes...")
+    print(f"\nEvaluating agent for {n_episodes} episodes...")
+    print("=" * 50)
     
     for episode in range(n_episodes):
         obs = env.reset()
@@ -249,6 +252,7 @@ def evaluate_agent(model, env, n_episodes=5, deterministic=True, render=False, m
         episode_reward = 0.0
         step_count = 0
         floor, keys, doors = 0, 0, 0
+        episode_start_time = time.time()
         
         while not done and step_count < max_steps:
             start_time = time.time()
@@ -279,33 +283,55 @@ def evaluate_agent(model, env, n_episodes=5, deterministic=True, render=False, m
             if isinstance(done, (list, np.ndarray)):
                 done = done[0]
         
+        # Calculate episode metrics
+        episode_duration = time.time() - episode_start_time
+        reward_per_step = episode_reward / step_count if step_count > 0 else 0
+        success = floor > 0  # Consider episode successful if reached next floor
+        
         # Record episode statistics
         episode_rewards.append(episode_reward)
         episode_lengths.append(step_count)
         floors_reached.append(floor)
         keys_collected.append(keys)
         doors_opened.append(doors)
+        episode_success.append(success)
+        episode_efficiency.append(reward_per_step)
         
-        print(f"Episode {episode+1}/{n_episodes}: "
-              f"Reward={episode_reward:.2f}, Steps={step_count}, "
-              f"Floor={floor}, Keys={keys}, Doors={doors}")
+        # Print detailed episode summary
+        print(f"\nEpisode {episode+1}/{n_episodes}:")
+        print(f"Duration: {episode_duration:.2f}s")
+        print(f"Steps: {step_count}")
+        print(f"Reward: {episode_reward:.2f}")
+        print(f"Reward/Step: {reward_per_step:.4f}")
+        print(f"Floor: {floor}")
+        print(f"Keys: {keys}")
+        print(f"Doors: {doors}")
+        print(f"Success: {'Yes' if success else 'No'}")
+        print("-" * 30)
     
-    # Calculate average metrics
+    # Calculate comprehensive statistics
+    success_rate = np.mean(episode_success) * 100
     avg_reward = np.mean(episode_rewards)
     avg_length = np.mean(episode_lengths)
     avg_floor = np.mean(floors_reached)
     avg_keys = np.mean(keys_collected)
     avg_doors = np.mean(doors_opened)
     avg_step_time = np.mean(time_per_step) if time_per_step else 0
+    avg_efficiency = np.mean(episode_efficiency)
     
-    print("\nEvaluation Results:")
-    print(f"Average Reward: {avg_reward:.2f}")
-    print(f"Average Episode Length: {avg_length:.2f}")
-    print(f"Average Floor Reached: {avg_floor:.2f}")
-    print(f"Average Keys Collected: {avg_keys:.2f}")
-    print(f"Average Doors Opened: {avg_doors:.2f}")
-    print(f"Average Time per Step: {avg_step_time*1000:.2f} ms")
+    # Print comprehensive results
+    print("\nEvaluation Results Summary:")
+    print("=" * 50)
+    print(f"Success Rate: {success_rate:.1f}%")
+    print(f"Average Reward: {avg_reward:.2f} ± {np.std(episode_rewards):.2f}")
+    print(f"Average Episode Length: {avg_length:.1f} ± {np.std(episode_lengths):.1f}")
+    print(f"Average Floor Reached: {avg_floor:.2f} ± {np.std(floors_reached):.2f}")
+    print(f"Average Keys Collected: {avg_keys:.2f} ± {np.std(keys_collected):.2f}")
+    print(f"Average Doors Opened: {avg_doors:.2f} ± {np.std(doors_opened):.2f}")
+    print(f"Average Reward/Step: {avg_efficiency:.4f} ± {np.std(episode_efficiency):.4f}")
+    print(f"Average Time per Step: {avg_step_time*1000:.2f}ms")
     print(f"Steps per Second: {1/avg_step_time:.2f}")
+    print("=" * 50)
     
     return {
         "episode_rewards": episode_rewards,
@@ -314,12 +340,16 @@ def evaluate_agent(model, env, n_episodes=5, deterministic=True, render=False, m
         "keys_collected": keys_collected,
         "doors_opened": doors_opened,
         "time_per_step": time_per_step,
+        "episode_success": episode_success,
+        "episode_efficiency": episode_efficiency,
         "avg_reward": avg_reward,
         "avg_length": avg_length,
         "avg_floor": avg_floor,
         "avg_keys": avg_keys,
         "avg_doors": avg_doors,
-        "avg_step_time": avg_step_time
+        "avg_step_time": avg_step_time,
+        "success_rate": success_rate,
+        "avg_efficiency": avg_efficiency
     }
 
 
