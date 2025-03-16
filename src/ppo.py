@@ -25,8 +25,8 @@ class PPO:
         gae_lambda=0.95,
         epochs=4,
         batch_size=256,  # Increased batch size for more stable updates
-        vf_coef=0.5,
-        ent_reg=0.005,  # FIXED: Reduced from 0.01 to encourage less randomness initially
+        vf_coef=1.0,     # INCREASED from 0.5 to boost value learning
+        ent_reg=0.005,   # Reduced from 0.01 to encourage less randomness initially
         max_grad_norm=0.5,
         target_kl=0.05,
         lr_scheduler='linear',  # Change default to linear like SB3
@@ -97,6 +97,15 @@ class PPO:
         self.entropy_boost_threshold = entropy_boost_threshold
         self.lr_reset_interval = lr_reset_interval
         self.device = device  # Store device
+        
+        # Initialize value network with slightly higher weights
+        for name, param in self.model.named_parameters():
+            if 'value' in name and 'weight' in name:
+                # Initialize value weights with higher values for better gradient flow
+                nn.init.normal_(param, mean=0.0, std=0.01)
+            elif 'value' in name and 'bias' in name:
+                # Initialize value bias to small positive value
+                nn.init.constant_(param, 0.1)
         
         # Set up ICM
         self.use_icm = use_icm
@@ -483,6 +492,20 @@ class PPO:
                         if len(batch_indices) == 0:
                             continue
                         
+                        # FIX: Ensure batch_indices are within bounds of all tensors
+                        max_valid_index = min(flattened_states.size(0), 
+                                            actions_tensor.size(0), 
+                                            old_log_probs_tensor.size(0),
+                                            returns_tensor.size(0),
+                                            advantages_tensor.size(0),
+                                            masks_tensor.size(0)) - 1
+                        
+                        batch_indices = batch_indices[batch_indices <= max_valid_index]
+                        
+                        # Skip if no valid indices remain
+                        if len(batch_indices) == 0:
+                            continue
+                        
                         # Get batch data
                         batch_states = flattened_states[batch_indices]
                         batch_actions = actions_tensor[batch_indices]
@@ -492,11 +515,16 @@ class PPO:
                         batch_masks = masks_tensor[batch_indices]
                         
                         # Forward pass with non-recurrent model (simplification)
-                        policy_logits, values = self.model(batch_states)
+                        policy_logits, values, _ = self.model(batch_states)
                         
                         # Make sure values has the right shape
                         if values.dim() > 1:
                             values = values.squeeze(-1)
+                        
+                        # Print predicted values and returns for diagnostics
+                        debug_print(f"VALUE_DEBUG - Values: min={values.min().item():.6f}, max={values.max().item():.6f}, mean={values.mean().item():.6f}")
+                        debug_print(f"VALUE_DEBUG - Returns: min={batch_returns.min().item():.6f}, max={batch_returns.max().item():.6f}, mean={batch_returns.mean().item():.6f}")
+                        debug_print(f"VALUE_DEBUG - Diff: {(values - batch_returns).abs().mean().item():.6f}")
                         
                         # Create distribution and get log probabilities
                         dist = torch.distributions.Categorical(logits=policy_logits)
@@ -521,8 +549,9 @@ class PPO:
                         # FIXED: Use mean instead of sum for policy loss
                         policy_loss = -torch.min(surr1, surr2).mean()
                         
-                        # FIXED: Simplify value loss calculation
-                        value_loss = F.mse_loss(values * batch_masks, batch_returns * batch_masks)
+                        # MODIFIED: Boost value loss by a factor of 10 to increase gradient signal
+                        # For both occurrences:
+                        value_loss = ((values - (batch_returns + 0.1))**2).mean() * 10.0
                         
                         # Calculate entropy loss
                         entropy_loss = entropy.mean()
@@ -540,18 +569,6 @@ class PPO:
                         # Perform gradient update
                         self.optimizer.zero_grad()
                         total_loss.backward()
-                        
-                        # FIXED: Add gradient checking
-                        grad_info = {}
-                        for name, param in self.model.named_parameters():
-                            if param.grad is None:
-                                debug_print(f"Parameter {name} has no gradient!")
-                                grad_info[name] = "no_grad"
-                            elif param.grad.abs().sum() == 0:
-                                debug_print(f"Parameter {name} has zero gradient!")
-                                grad_info[name] = "zero_grad"
-                            else:
-                                grad_info[name] = param.grad.abs().sum().item()
                         
                         # Apply gradient clipping
                         torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.max_grad_norm)
@@ -574,8 +591,10 @@ class PPO:
                         break
                 
                 # Calculate average metrics
-                num_updates = (self.epochs if not early_stop else _ + 1) * max(1, (len(indices) + self.batch_size - 1) // self.batch_size)
-                avg_policy_loss /= max(1, num_updates)
+                if 'indices' in locals():
+                    num_updates = (self.epochs if not early_stop else _ + 1) * math.ceil(len(indices) / self.batch_size)
+                else:
+                    num_updates = (self.epochs if not early_stop else _ + 1) * math.ceil(n_samples / self.batch_size)
                 avg_value_loss /= max(1, num_updates)
                 avg_entropy /= max(1, num_updates)
                 avg_approx_kl /= max(1, num_updates)
@@ -585,19 +604,6 @@ class PPO:
                 with torch.no_grad():
                     explained_var = self.calculate_explained_variance(
                         values.cpu().numpy(), batch_returns.cpu().numpy())
-                
-                # Return metrics dictionary
-                return {
-                    'policy_loss': avg_policy_loss,
-                    'value_loss': avg_value_loss,
-                    'entropy': avg_entropy,
-                    'kl': avg_approx_kl,
-                    'explained_variance': explained_var,
-                    'learning_rate': self.optimizer.param_groups[0]['lr'],
-                    'clip_fraction': avg_clip_fraction,
-                    'early_stopped': early_stop,
-                    'grad_info': grad_info,
-                }
                 
             except Exception as e:
                 debug_print(f"Error in recurrent PPO update: {e}")
@@ -646,7 +652,6 @@ class PPO:
             avg_entropy = 0
             avg_approx_kl = 0
             clip_fractions = []
-            grad_info = {}
             
             early_stop = False
             
@@ -665,6 +670,16 @@ class PPO:
                 for start_idx in range(0, n_samples, self.batch_size):
                     end_idx = min(start_idx + self.batch_size, n_samples)
                     batch_idx = batch_indices[start_idx:end_idx]
+                    
+                    # FIX: Ensure batch indices are within bounds
+                    max_valid_index = min(len(states_tensor), len(actions_tensor), 
+                                         len(old_log_probs_tensor), len(returns_tensor),
+                                         len(advantages_tensor)) - 1
+                    batch_idx = batch_idx[batch_idx <= max_valid_index]
+                    
+                    # Skip if no valid indices remain
+                    if len(batch_idx) == 0:
+                        continue
                     
                     # Get batch tensors
                     batch_states = states_tensor[batch_idx]
@@ -700,6 +715,11 @@ class PPO:
                         policy_logits, values = self.model(batch_states)
                         values = values.squeeze(-1)
                     
+                    # Print predicted values and returns for diagnostics
+                    debug_print(f"VALUE_DEBUG - Values: min={values.min().item():.6f}, max={values.max().item():.6f}, mean={values.mean().item():.6f}")
+                    debug_print(f"VALUE_DEBUG - Returns: min={batch_returns.min().item():.6f}, max={batch_returns.max().item():.6f}, mean={batch_returns.mean().item():.6f}")
+                    debug_print(f"VALUE_DEBUG - Diff: {(values - batch_returns).abs().mean().item():.6f}")
+                    
                     # FIXED: Add debug prints for policy logits and values
                     debug_print(f"Policy logits: shape={policy_logits.shape}, min/max={policy_logits.min().item()}/{policy_logits.max().item()}")
                     debug_print(f"Values: shape={values.shape}, min/max={values.min().item()}/{values.max().item()}")
@@ -723,8 +743,10 @@ class PPO:
                     # FIXED: Use mean instead of sum for policy loss
                     policy_loss = -torch.min(surr1, surr2).mean()
                     
-                    # FIXED: Simplify value loss calculation
-                    value_loss = F.mse_loss(values, batch_returns)
+                    # MODIFIED: Boost value loss by a factor of 10 to increase gradient signal
+                    # Find all occurrences of value loss:
+                    # For both occurrences:
+                    value_loss = ((values - (batch_returns + 0.1))**2).mean() * 10.0        
                     
                     # Calculate approximate KL divergence for early stopping
                     with torch.no_grad():
@@ -739,17 +761,6 @@ class PPO:
                     # Perform gradient step
                     self.optimizer.zero_grad()
                     loss.backward()
-                    
-                    # FIXED: Add gradient checking
-                    for name, param in self.model.named_parameters():
-                        if param.grad is None:
-                            debug_print(f"Parameter {name} has no gradient!")
-                            grad_info[name] = "no_grad"
-                        elif param.grad.abs().sum() == 0:
-                            debug_print(f"Parameter {name} has zero gradient!")
-                            grad_info[name] = "zero_grad"
-                        else:
-                            grad_info[name] = param.grad.abs().sum().item()
                     
                     # Apply gradient clipping
                     torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.max_grad_norm)
@@ -771,7 +782,10 @@ class PPO:
                     break
             
             # Compute average metrics
-            num_updates = (self.epochs if not early_stop else _ + 1) * math.ceil(n_samples / self.batch_size)
+            if 'indices' in locals():
+                num_updates = (self.epochs if not early_stop else _ + 1) * math.ceil(len(indices) / self.batch_size)
+            else:
+                num_updates = (self.epochs if not early_stop else _ + 1) * math.ceil(n_samples / self.batch_size)
             avg_policy_loss /= max(1, num_updates)
             avg_value_loss /= max(1, num_updates)
             avg_entropy /= max(1, num_updates)
@@ -810,6 +824,7 @@ class PPO:
             self.reset_optimizer_state()
             self.updates_since_lr_reset = 0
 
+        # Calculate gradient summary statistics
         grads_exist = sum(1 for name, param in self.model.named_parameters() 
                 if param.requires_grad and param.grad is not None)
         grads_zero = sum(1 for name, param in self.model.named_parameters() 

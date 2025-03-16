@@ -526,7 +526,8 @@ def shape_reward(reward, info, action, prev_info=None, prev_keys=None, episodic_
     # 2. Key collection bonus
     current_keys = info.get("total_keys", 0)
     if prev_keys is not None and current_keys > prev_keys:
-        key_bonus = 1.0  # Substantial bonus for collecting keys
+        print(f"KEY COLLECTED! prev={prev_keys}, current={current_keys}")
+        key_bonus = 5.0  # Was 1.0
         shaped_reward += key_bonus
         reward_components['key_bonus'] = key_bonus
         
@@ -537,7 +538,7 @@ def shape_reward(reward, info, action, prev_info=None, prev_keys=None, episodic_
     
     # 3. Door opening bonus (key usage)
     if prev_keys is not None and current_keys < prev_keys:
-        door_bonus = 2.0  # Significant bonus for using keys effectively
+        door_bonus = 10.0  # Was 2.0
         shaped_reward += door_bonus
         reward_components['door_bonus'] = door_bonus
         
@@ -553,6 +554,9 @@ def shape_reward(reward, info, action, prev_info=None, prev_keys=None, episodic_
             exploration_bonus = 0.1
             shaped_reward += exploration_bonus
             reward_components['exploration_bonus'] = exploration_bonus
+    
+    # if episodic_memory and episodic_memory.is_key_location_nearby(current_floor, position, 5.0):
+    #     shaped_reward += 0.05  # Small bonus for being near keys
     
     # 5. Basic movement bonuses
     # Extract movement from action
@@ -811,8 +815,8 @@ def main(args):
         # Initial curriculum settings
         curriculum_config = {
             'starting_floor': 0,
-            'max_floor': 0,  # Start with just floor 0
-            'difficulty': 0  # Start with easiest difficulty
+            'max_floor': 15,  # Start with just floor 0
+            'difficulty': 1  # Start with easiest difficulty
         }
         # Tracking for curriculum adjustment
         curriculum_attempts = 0
@@ -928,16 +932,16 @@ def main(args):
                     
                     # Track floor-specific success rate
                     floor_reached = info.get("current_floor", 0)
-                    if floor_reached not in curriculum_floor_success_history:
+                    if floor_reached not in curriculum_floor_success_history and floor_reached != 0:
                         curriculum_floor_success_history[floor_reached] = {
                             'attempts': 0,
                             'successes': 0
                         }
-                    curriculum_floor_success_history[floor_reached]['attempts'] += 1
+                        curriculum_floor_success_history[floor_reached]['attempts'] += 1
                     
                     # More aggressive floor advancement
                     # Check if agent reached or exceeded target floor
-                    if floor_reached >= current_curriculum_floor:
+                    if floor_reached > current_curriculum_floor:
                         curriculum_successes += 1
                         curriculum_success_streak += 1
                         
@@ -954,7 +958,7 @@ def main(args):
                             with torch.no_grad():
                                 # Sample a few actions and print probabilities
                                 test_state = torch.FloatTensor(state).unsqueeze(0).to(device)
-                                policy_logits, _ = model(test_state)
+                                policy_logits = model(test_state)
                                 probs = F.softmax(policy_logits, dim=1)
                                 logger.log_event("DIAGNOSTIC", f"Action probs: {probs.cpu().numpy()}")
 
@@ -1117,7 +1121,9 @@ def main(args):
             
             # Track highest floor reached
             info_floor = info.get("current_floor", 0)
-            if info_floor > current_floor:
+            temp = current_floor
+            current_floor = info_floor
+            if info_floor > temp:
                 current_floor = info_floor
                 if current_floor > max_floor_reached:
                     max_floor_reached = current_floor
@@ -1141,6 +1147,7 @@ def main(args):
                         # Replace direct print with logging call
                         logger.log_event("ERROR", f"ERROR saving floor checkpoint: {e}")
                         traceback.print_exc()
+            # to restore the current floor
             
             # Apply simplified reward shaping
             current_keys = info.get("total_keys", 0)
@@ -1778,7 +1785,8 @@ def preprocess_observation_for_icm(observation, frame_stack):
     # Verify the shapes before concatenating
     for i, frame in enumerate(frame_stack):
         if frame.shape != (3, 84, 84):
-            print(f"Warning: Frame {i} has unexpected shape {frame.shape}, reshaping...")
+            if args.verbosity > 1:
+                print(f"Warning: Frame {i} has unexpected shape {frame.shape}, reshaping...")
             # Try to reshape if possible
             if frame.size == 3*84*84:
                 frame_stack[i] = frame.reshape(3, 84, 84)
