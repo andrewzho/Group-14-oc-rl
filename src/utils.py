@@ -203,7 +203,79 @@ class ActionFlattener:
         return {_scalar: _action for (_scalar, _action) in enumerate(all_actions)}
 
     def lookup_action(self, action):
-        return self.action_lookup[action]
+        """
+        Look up the actual action tuple from the flattened action index.
+        
+        Args:
+            action: The flattened action index
+            
+        Returns:
+            The corresponding action tuple
+        """
+        try:
+            # Handle every possible input type
+            
+            # Case 1: action is a numpy array
+            if isinstance(action, np.ndarray):
+                if action.size == 1:
+                    # Single element array
+                    action = action.item()
+                elif action.size > 1:
+                    # Multi-element array, take the first element
+                    action = int(action.flat[0])
+                else:
+                    # Empty array, default to action 0
+                    action = 0
+                    
+            # Case 2: action is a torch tensor
+            elif hasattr(action, 'dim') and callable(getattr(action, 'dim')):  # Check if it's a torch tensor
+                try:
+                    if action.numel() == 1:
+                        # Single element tensor
+                        action = action.item()
+                    else:
+                        # Multi-element tensor
+                        action = action.view(-1)[0].item()
+                except Exception as e:
+                    # If item() fails, convert to int directly
+                    try:
+                        action = int(action.detach().cpu().numpy().flat[0])
+                    except:
+                        # Emergency fallback
+                        action = 0
+                        print(f"Warning: Could not convert tensor to action index: {e}, using default action 0")
+            
+            # Case 3: action is a list or tuple
+            elif isinstance(action, (list, tuple)):
+                if len(action) > 0:
+                    # Take the first element
+                    action = int(action[0])
+                else:
+                    # Empty list, default to action 0
+                    action = 0
+            
+            # Case 4: try to convert to int (handles float, bool, etc.)
+            else:
+                try:
+                    action = int(action)
+                except:
+                    # If all else fails, default to action 0
+                    action = 0
+                    print(f"Warning: Could not convert {action} to int, using default action 0")
+            
+            # Now perform the lookup with a proper hashable key
+            if action in self.action_lookup:
+                return self.action_lookup[action]
+            else:
+                # Handle out-of-bounds index (use modulo to wrap around)
+                valid_action = action % len(self.action_lookup)
+                print(f"Warning: Action index {action} out of bounds, using {valid_action} instead")
+                return self.action_lookup[valid_action]
+                
+        except Exception as e:
+            # Global emergency fallback - return the first action
+            print(f"Error in lookup_action: {e}, returning default action")
+            return self.action_lookup[0]
         
 class MetricsTracker:
     """
@@ -244,15 +316,59 @@ class MetricsTracker:
             
     def update_from_ppo(self, ppo):
         """Update metrics from a PPO object"""
-        self.metrics['policy_losses'] = ppo.policy_losses
-        self.metrics['value_losses'] = ppo.value_losses
-        self.metrics['entropy_values'] = ppo.entropy_values
-        self.metrics['clip_fractions'] = ppo.clip_fractions
-        self.metrics['approx_kl_divs'] = ppo.approx_kl_divs
+        # Use getattr with default values to avoid AttributeError if attributes don't exist
+        if hasattr(ppo, 'policy_losses'):
+            self.metrics['policy_losses'] = ppo.policy_losses
+        elif hasattr(ppo, 'policy_loss'):
+            # If there's a single value instead of a list
+            if 'policy_losses' not in self.metrics:
+                self.metrics['policy_losses'] = []
+            self.metrics['policy_losses'].append(ppo.policy_loss)
+            
+        if hasattr(ppo, 'value_losses'):
+            self.metrics['value_losses'] = ppo.value_losses
+        elif hasattr(ppo, 'value_loss'):
+            # If there's a single value instead of a list
+            if 'value_losses' not in self.metrics:
+                self.metrics['value_losses'] = []
+            self.metrics['value_losses'].append(ppo.value_loss)
+            
+        if hasattr(ppo, 'entropy_values'):
+            self.metrics['entropy_values'] = ppo.entropy_values
+        elif hasattr(ppo, 'entropy'):
+            # If there's a single value instead of a list
+            if 'entropy_values' not in self.metrics:
+                self.metrics['entropy_values'] = []
+            self.metrics['entropy_values'].append(ppo.entropy)
+            
+        if hasattr(ppo, 'clip_fractions'):
+            self.metrics['clip_fractions'] = ppo.clip_fractions
+        
+        if hasattr(ppo, 'approx_kl_divs'):
+            self.metrics['approx_kl_divs'] = ppo.approx_kl_divs
+        elif hasattr(ppo, 'approx_kl'):
+            if 'approx_kl_divs' not in self.metrics:
+                self.metrics['approx_kl_divs'] = []
+            self.metrics['approx_kl_divs'].append(ppo.approx_kl)
+        elif hasattr(ppo, 'kl_divergence'):
+            if 'approx_kl_divs' not in self.metrics:
+                self.metrics['approx_kl_divs'] = []
+            self.metrics['approx_kl_divs'].append(ppo.kl_divergence)
+            
         if hasattr(ppo, 'explained_variances'):
             self.metrics['explained_variances'] = ppo.explained_variances
+        elif hasattr(ppo, 'explained_variance'):
+            if 'explained_variances' not in self.metrics:
+                self.metrics['explained_variances'] = []
+            self.metrics['explained_variances'].append(ppo.explained_variance)
+            
         if hasattr(ppo, 'learning_rates'):
             self.metrics['learning_rates'] = ppo.learning_rates
+        elif hasattr(ppo, 'optimizer') and hasattr(ppo.optimizer, 'param_groups'):
+            # Extract current learning rate from optimizer
+            if 'learning_rates' not in self.metrics:
+                self.metrics['learning_rates'] = []
+            self.metrics['learning_rates'].append(ppo.optimizer.param_groups[0]['lr'])
             
     def save(self, plot=True):
         """Save metrics to disk"""
