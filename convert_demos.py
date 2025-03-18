@@ -7,7 +7,7 @@ This script processes demonstration data consisting of:
 - rewards.json file containing reward sequence
 
 Usage:
-    python convert_demos.py --input raw_demos --output demonstrations/demonstrations.pkl
+    python convert_demos.py --input raw_demos --output demonstrations/demonstrations1.pkl --resize 64,64 --batch-size 10 --frame-skip 2
 """
 import os
 import json
@@ -19,6 +19,7 @@ import pickle
 from tqdm import tqdm
 import sys
 import logging
+import gc  # Added for garbage collection
 from typing import List, Tuple, Dict, Any, Optional, Union
 
 # Configure logging
@@ -197,7 +198,7 @@ def process_action(action: Any, retro: bool = True) -> Any:
 
 def process_demonstration_batch(image_files: List[str], actions: List[Any], rewards: List[float], 
                               resize: Optional[Tuple[int, int]] = None, retro: bool = True,
-                              batch_size: int = 100) -> Tuple[List, List, List, List, List]:
+                              batch_size: int = 100, grayscale: bool = False) -> Tuple[List, List, List, List, List]:
     """
     Process a batch of demonstration data.
     
@@ -208,6 +209,7 @@ def process_demonstration_batch(image_files: List[str], actions: List[Any], rewa
         resize: Tuple (height, width) to resize images to, or None for no resizing
         retro: Whether to use retro format
         batch_size: Number of items to process in a batch
+        grayscale: Whether to convert images to grayscale
         
     Returns:
         tuple: (observations, actions, rewards, next_observations, dones)
@@ -242,16 +244,22 @@ def process_demonstration_batch(image_files: List[str], actions: List[Any], rewa
             if resize is not None:
                 obs = cv2.resize(obs, (resize[1], resize[0]), interpolation=cv2.INTER_AREA)
             
+            # Convert to grayscale if requested
+            if grayscale:
+                obs = cv2.cvtColor(obs, cv2.COLOR_RGB2GRAY)
+                # Add channel dimension for grayscale
+                obs = np.expand_dims(obs, 0)
+            else:
+                # Convert to channel-first format (HWC -> CHW)
+                obs = np.transpose(obs, (2, 0, 1))
+            
             # For retro mode, keep as uint8 (0-255 range)
             # Otherwise, normalize to 0-1 float32
             if not retro:
                 obs = obs.astype(np.float32) / 255.0
-                
-            # Convert to channel-first format (HWC -> CHW)
-            obs = np.transpose(obs, (2, 0, 1))
             
             # Stack frames for 4-channel format (needed for model compatibility)
-            if obs.shape[0] == 3:  # If RGB
+            if not grayscale and obs.shape[0] == 3:  # If RGB
                 # Duplicate first channel to create 4 channels
                 obs = np.concatenate([obs[:1], obs], axis=0)[:4]
                 
@@ -262,6 +270,9 @@ def process_demonstration_batch(image_files: List[str], actions: List[Any], rewa
         # Process actions
         batch_processed_actions = [process_action(action, retro) for action in batch_actions]
         processed_actions.extend(batch_processed_actions)
+        
+        # Force garbage collection after processing each batch
+        gc.collect()
     
     # Create next_observations by shifting
     next_observations = observations[1:] + [observations[-1]]
@@ -272,8 +283,9 @@ def process_demonstration_batch(image_files: List[str], actions: List[Any], rewa
     return observations, processed_actions, rewards, next_observations, dones
 
 
-def load_demonstration_folder(folder_path: str, resize: Optional[Tuple[int, int]] = (84, 84), 
-                             retro: bool = True, batch_size: int = 100) -> Tuple[List, List, List, List, List]:
+def load_demonstration_folder(folder_path: str, resize: Optional[Tuple[int, int]] = (64, 64), 
+                             retro: bool = True, batch_size: int = 20, 
+                             frame_skip: int = 1, grayscale: bool = False) -> Tuple[List, List, List, List, List]:
     """
     Load demonstration data from a folder.
     
@@ -282,6 +294,8 @@ def load_demonstration_folder(folder_path: str, resize: Optional[Tuple[int, int]
         resize: Tuple (height, width) to resize images to, or None for no resizing
         retro: Whether to use retro format (smaller observations)
         batch_size: Number of items to process in a batch
+        frame_skip: Process only every Nth frame
+        grayscale: Whether to convert images to grayscale
         
     Returns:
         tuple: (observations, actions, rewards, next_observations, dones)
@@ -294,16 +308,26 @@ def load_demonstration_folder(folder_path: str, resize: Optional[Tuple[int, int]
     # Get sorted image files
     image_files = get_sorted_image_files(folder_path)
     
+    # Apply frame skipping
+    if frame_skip > 1:
+        logger.info(f"Applying frame skip: {frame_skip}")
+        image_files = image_files[::frame_skip]
+        actions = actions[::frame_skip]
+        rewards = rewards[::frame_skip]
+    
     # Process the demonstration data
     observations, processed_actions, rewards, next_observations, dones = process_demonstration_batch(
-        image_files, actions, rewards, resize, retro, batch_size
+        image_files, actions, rewards, resize, retro, batch_size, grayscale
     )
     
     # Print summary
     logger.info(f"Loaded {len(observations)} observations, {len(processed_actions)} actions, {len(rewards)} rewards")
-    logger.info(f"Observation shape: {observations[0].shape}, dtype: {observations[0].dtype}")
-    logger.info(f"Action sample: {processed_actions[0]}")
-    logger.info(f"Reward range: {min(rewards)} to {max(rewards)}, sum: {sum(rewards)}")
+    if observations:
+        logger.info(f"Observation shape: {observations[0].shape}, dtype: {observations[0].dtype}")
+    if processed_actions:
+        logger.info(f"Action sample: {processed_actions[0]}")
+    if rewards:
+        logger.info(f"Reward range: {min(rewards)} to {max(rewards)}, sum: {sum(rewards)}")
     
     return observations, processed_actions, rewards, next_observations, dones
 
@@ -334,10 +358,10 @@ def validate_buffer(buffer: DemonstrationBuffer) -> bool:
         if isinstance(obs, np.ndarray):
             logger.info(f"Sample observation shape: {obs.shape}")
             if len(obs.shape) == 4:  # Batch, Channel, Height, Width
-                logger.info(f"Observation format: {'NCHW (correct)' if obs.shape[1] in [3, 4] else 'unknown'}")
+                logger.info(f"Observation format: {'NCHW (correct)' if obs.shape[1] in [1, 3, 4] else 'unknown'}")
                 logger.info(f"Number of channels: {obs.shape[1]}")
             elif len(obs.shape) == 3:  # Channel, Height, Width (single observation)
-                logger.info(f"Observation format: {'CHW (correct)' if obs.shape[0] in [3, 4] else 'unknown'}")
+                logger.info(f"Observation format: {'CHW (correct)' if obs.shape[0] in [1, 3, 4] else 'unknown'}")
                 logger.info(f"Number of channels: {obs.shape[0]}")
             
         # Check action format
@@ -357,9 +381,11 @@ def main():
     parser = argparse.ArgumentParser(description="Convert demonstration data to DemonstrationBuffer format")
     parser.add_argument("--input", type=str, default="raw_demos", help="Directory containing demonstration folders")
     parser.add_argument("--output", type=str, default="demonstrations/demonstrations1.pkl", help="Output file path")
-    parser.add_argument("--resize", type=str, default="84,84", help="Resize observations to height,width")
+    parser.add_argument("--resize", type=str, default="64,64", help="Resize observations to height,width")
     parser.add_argument("--retro", action="store_true", help="Use retro format (uint8, 0-255 range)")
-    parser.add_argument("--batch-size", type=int, default=100, help="Batch size for processing")
+    parser.add_argument("--batch-size", type=int, default=20, help="Batch size for processing")
+    parser.add_argument("--frame-skip", type=int, default=1, help="Process only every Nth frame")
+    parser.add_argument("--grayscale", action="store_true", help="Convert images to grayscale")
     parser.add_argument("--validate", action="store_true", help="Validate buffer after creation")
     parser.add_argument("--verbose", action="store_true", help="Enable verbose logging")
     args = parser.parse_args()
@@ -402,10 +428,14 @@ def main():
     for folder in demo_folders:
         try:
             obs, acts, rews, next_obs, dones = load_demonstration_folder(
-                folder, resize=resize, retro=args.retro, batch_size=args.batch_size
+                folder, resize=resize, retro=args.retro, batch_size=args.batch_size,
+                frame_skip=args.frame_skip, grayscale=args.grayscale
             )
             buffer.add_episode(obs, acts, rews, next_obs, dones)
             logger.info(f"Added episode from {folder} to buffer")
+            
+            # Force garbage collection after processing each folder
+            gc.collect()
         except Exception as e:
             logger.error(f"Error processing folder {folder}: {e}")
             import traceback
@@ -422,11 +452,14 @@ def main():
     logger.info(f"Contains {buffer.total_transitions} transitions from {buffer.num_episodes} episodes")
     
     # Show buffer statistics
-    stats = buffer.get_statistics()
-    logger.info("\nDemonstration Statistics:")
-    logger.info(f"Average Episode Length: {stats['avg_episode_length']:.2f} steps")
-    logger.info(f"Average Episode Reward: {stats['avg_episode_reward']:.2f}")
-    logger.info(f"Min/Max/Mean Reward: {stats['min_reward']:.2f}/{stats['max_reward']:.2f}/{stats['mean_reward']:.2f}")
+    try:
+        stats = buffer.get_statistics()
+        logger.info("\nDemonstration Statistics:")
+        logger.info(f"Average Episode Length: {stats['avg_episode_length']:.2f} steps")
+        logger.info(f"Average Episode Reward: {stats['avg_episode_reward']:.2f}")
+        logger.info(f"Min/Max/Mean Reward: {stats['min_reward']:.2f}/{stats['max_reward']:.2f}/{stats['mean_reward']:.2f}")
+    except Exception as e:
+        logger.error(f"Error generating statistics: {e}")
 
 
 if __name__ == "__main__":

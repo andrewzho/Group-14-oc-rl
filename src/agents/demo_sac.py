@@ -36,7 +36,7 @@ class DemoSAC(SAC):
         policy: Union[str, Type[SACPolicy]],
         env: Union[GymEnv, str],
         learning_rate: Union[float, Schedule] = 3e-4,
-        buffer_size: int = 1000000,
+        buffer_size: int = 500000,
         learning_starts: int = 100,
         batch_size: int = 256,
         tau: float = 0.005,

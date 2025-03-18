@@ -14,6 +14,52 @@ from typing import Tuple, Dict, List, Any, Optional, Union
 import cv2
 from collections import deque
 
+import gym
+import numpy as np
+
+class StableBaselinesFix(gym.Wrapper):
+    """
+    Ensures observations are compatible with Stable-Baselines3 vectorized environments.
+    """
+    def __init__(self, env):
+        super().__init__(env)
+        self.observation_space = env.observation_space
+        
+    def reset(self, **kwargs):
+        obs = self.env.reset(**kwargs)
+        
+        # Handle multiple return values (newer gym API)
+        if isinstance(obs, tuple):
+            obs = obs[0]
+            
+        # Ensure observation matches expected shape exactly
+        if isinstance(obs, np.ndarray) and obs.shape == self.observation_space.shape:
+            # Already matches, no change needed
+            return obs
+        else:
+            # Force correct shape
+            print(f"Warning: Reshaping observation from {obs.shape if hasattr(obs, 'shape') else 'unknown'} to {self.observation_space.shape}")
+            return np.zeros(self.observation_space.shape, dtype=self.observation_space.dtype)
+    
+    def step(self, action):
+        result = self.env.step(action)
+        
+        # Handle different gym API versions
+        if len(result) == 4:
+            obs, reward, done, info = result
+        else:
+            # Newer gym API
+            obs, reward, terminated, truncated, info = result
+            done = terminated or truncated
+            
+        # Ensure observation matches expected shape exactly
+        if isinstance(obs, np.ndarray) and obs.shape == self.observation_space.shape:
+            # Already matches, no change needed
+            return obs, reward, done, info
+        else:
+            # Force correct shape
+            print(f"Warning: Reshaping observation from {obs.shape if hasattr(obs, 'shape') else 'unknown'} to {self.observation_space.shape}")
+            return np.zeros(self.observation_space.shape, dtype=self.observation_space.dtype), reward, done, info
 
 class GymVersionBridge(gym.Wrapper):
     """Compatibility wrapper to handle different Gym API versions"""

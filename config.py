@@ -23,7 +23,7 @@ ENV_CONFIG = {
     "realtime_mode": False,
     "timeout_wait": 60,
     "docker_training": False,
-    "resolution": (84, 84),  # Resized observation shape
+    "resolution": (42, 42),  # Updated to match actual observation size
     "stack_frames": 4,  # Number of frames to stack
     "grayscale": True,  # Convert to grayscale
     "seed": 42,
@@ -33,9 +33,9 @@ ENV_CONFIG = {
 SAC_CONFIG = {
     "policy_type": "CnnPolicy",
     "learning_rate": 1e-3,  # Increased from 3e-4 to 1e-3 for faster learning
-    "buffer_size": 1000000,
+    "buffer_size": 50000,   # Reduced buffer size to save memory
     "learning_starts": 10000,  # Reduced to start learning earlier
-    "batch_size": 512,  # Increased from 256 to 512 for better stability
+    "batch_size": 256,      # Reduced from 512 to 256 to save memory
     "tau": 0.01,  # Increased from 0.005 for faster target network updates
     "gamma": 0.99,
     "train_freq": 1,
@@ -52,7 +52,7 @@ SAC_CONFIG = {
 
 # Random Network Distillation parameters
 RND_CONFIG = {
-    "feature_dim": 512,  # Output dimension of RND networks
+    "feature_dim": 256,  # Reduced from 512 to save memory
     "learning_rate": 1e-4,
     "intrinsic_reward_coef": 0.1,  # Weight for intrinsic rewards
     "normalization": True,  # Normalize observations
@@ -85,13 +85,13 @@ EVAL_CONFIG = {
     "render": False,
 }
 
-# Neural network architecture
+# Neural network architecture - reduced size to save memory
 NETWORK_CONFIG = {
     "cnn_features": [
-        {"in_channels": 4, "out_channels": 64, "kernel_size": 8, "stride": 4},  # Increased channels
-        {"in_channels": 64, "out_channels": 128, "kernel_size": 4, "stride": 2},  # Increased channels
-        {"in_channels": 128, "out_channels": 128, "kernel_size": 3, "stride": 1},  # Increased channels
+        {"in_channels": 4, "out_channels": 32, "kernel_size": 8, "stride": 4},  # Reduced from 64
+        {"in_channels": 32, "out_channels": 64, "kernel_size": 4, "stride": 2},  # Reduced from 128
+        {"in_channels": 64, "out_channels": 64, "kernel_size": 3, "stride": 1},  # Reduced from 128
     ],
-    "hidden_dim": 1024,  # Increased from 512 to 1024
-    "latent_dim": 512,  # Increased from 256 to 512
+    "hidden_dim": 512,  # Reduced from 1024
+    "latent_dim": 256,  # Reduced from 512
 }
