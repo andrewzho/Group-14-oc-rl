@@ -205,6 +205,8 @@ class RecurrentPPONetwork(nn.Module):
         """Initialize LSTM hidden and cell states."""
         if device is None:
             device = next(self.parameters()).device
+        elif isinstance(device, str):
+            device = torch.device(device)
             
         # Create hidden states matching the number of LSTM layers (2)
         num_layers = 2  # Match the num_layers parameter in the LSTM constructor

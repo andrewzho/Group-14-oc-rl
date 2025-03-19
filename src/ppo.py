@@ -2,10 +2,11 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import numpy as np
-from typing import Dict, List, Tuple
+from typing import Dict, List, Tuple, Optional, Union
 import torch.optim as optim
 import math
 import os
+import logging
 
 # Add global debug flag that respects verbosity setting
 DEBUG_MODE = os.environ.get('DEBUG', '0') == '1'
@@ -44,7 +45,7 @@ class PPO:
         icm_feature_dim=256,           # Feature dimension for ICM module
         use_recurrent=False,           # Whether to use recurrent policy (LSTM)
         recurrent_seq_len=8,           # Sequence length for recurrent training
-        device=torch.device("cuda" if torch.cuda.is_available() else "cpu")  # Add device parameter with default value
+        device=torch.device("cpu")  # Change default to CPU
     ):
         """
         Proximal Policy Optimization algorithm with adaptive entropy and enhanced exploration.
@@ -78,7 +79,15 @@ class PPO:
             recurrent_seq_len: Sequence length for recurrent training
             device: Device to use for tensor operations (e.g., 'cpu', 'cuda')
         """
-        self.model = model
+        # Ensure device is properly initialized
+        if isinstance(device, str):
+            device = torch.device(device)
+        self.device = device
+        
+        # Move model to device and ensure it's in the correct mode
+        self.model = model.to(self.device)
+        if self.device.type == 'cpu':
+            self.model = self.model.cpu()
         self.lr = lr
         self.clip_eps = clip_eps
         self.gamma = gamma
@@ -96,7 +105,6 @@ class PPO:
         self.update_adv_batch_norm = update_adv_batch_norm
         self.entropy_boost_threshold = entropy_boost_threshold
         self.lr_reset_interval = lr_reset_interval
-        self.device = device  # Store device
         
         # Initialize value network with slightly higher weights
         for name, param in self.model.named_parameters():
@@ -592,9 +600,9 @@ class PPO:
                 
                 # Calculate average metrics
                 if 'indices' in locals():
-                    num_updates = (self.epochs if not early_stop else _ + 1) * math.ceil(len(indices) / self.batch_size)
+                    num_updates = (self.epochs if not early_stop else self.epochs + 1) * math.ceil(len(indices) / self.batch_size)
                 else:
-                    num_updates = (self.epochs if not early_stop else _ + 1) * math.ceil(n_samples / self.batch_size)
+                    num_updates = (self.epochs if not early_stop else self.epochs + 1) * math.ceil(n_samples / self.batch_size)
                 avg_value_loss /= max(1, num_updates)
                 avg_entropy /= max(1, num_updates)
                 avg_approx_kl /= max(1, num_updates)
@@ -783,9 +791,9 @@ class PPO:
             
             # Compute average metrics
             if 'indices' in locals():
-                num_updates = (self.epochs if not early_stop else _ + 1) * math.ceil(len(indices) / self.batch_size)
+                num_updates = (self.epochs if not early_stop else self.epochs + 1) * math.ceil(len(indices) / self.batch_size)
             else:
-                num_updates = (self.epochs if not early_stop else _ + 1) * math.ceil(n_samples / self.batch_size)
+                num_updates = (self.epochs if not early_stop else self.epochs + 1) * math.ceil(n_samples / self.batch_size)
             avg_policy_loss /= max(1, num_updates)
             avg_value_loss /= max(1, num_updates)
             avg_entropy /= max(1, num_updates)
@@ -1192,3 +1200,219 @@ class PPO:
         except Exception as e:
             debug_print(f"Error in get_intrinsic_reward: {e}")
             return 0.0
+
+
+class DemoPPO(PPO):
+    def __init__(self, model, lr=3e-4, clip_eps=0.2, gamma=0.99, gae_lambda=0.95,
+                 epochs=10, batch_size=128, vf_coef=0.5, ent_reg=0.01,
+                 max_grad_norm=0.5, target_kl=0.01, lr_scheduler='linear',
+                 adaptive_entropy=False, min_entropy=0.01, entropy_decay_factor=0.9995,
+                 update_adv_batch_norm=False, entropy_boost_threshold=0.001,
+                 lr_reset_interval=None, use_icm=False, icm_lr=1e-4,
+                 icm_reward_scale=0.01, icm_forward_weight=0.2, icm_inverse_weight=0.8,
+                 icm_feature_dim=256, device='cpu', use_recurrent=False,
+                 recurrent_seq_len=8, demo_buffer=None, bc_weight=0.1, 
+                 demo_batch_size=64, demo_sampling_ratio=0.25):
+        
+        # First set these attributes before calling super().__init__
+        self.demo_buffer = demo_buffer
+        self.bc_weight = bc_weight  # Weight for behavior cloning loss
+        self.demo_batch_size = demo_batch_size
+        self.demo_sampling_ratio = demo_sampling_ratio
+        self.demo_updates = 0  # Initialize demo_updates counter
+        
+        # Call parent constructor with explicit device parameter
+        super().__init__(model=model, lr=lr, clip_eps=clip_eps, gamma=gamma, 
+                        gae_lambda=gae_lambda, epochs=epochs, batch_size=batch_size,
+                        vf_coef=vf_coef, ent_reg=ent_reg, max_grad_norm=max_grad_norm,
+                        target_kl=target_kl, lr_scheduler=lr_scheduler,
+                        adaptive_entropy=adaptive_entropy, min_entropy=min_entropy,
+                        entropy_decay_factor=entropy_decay_factor,
+                        update_adv_batch_norm=update_adv_batch_norm,
+                        entropy_boost_threshold=entropy_boost_threshold,
+                        lr_reset_interval=lr_reset_interval, use_icm=use_icm,
+                        icm_lr=icm_lr, icm_reward_scale=icm_reward_scale,
+                        icm_forward_weight=icm_forward_weight,
+                        icm_inverse_weight=icm_inverse_weight,
+                        icm_feature_dim=icm_feature_dim, device=device,
+                        use_recurrent=use_recurrent,
+                        recurrent_seq_len=recurrent_seq_len)
+        
+        # Move demo buffer to correct device if it's a tensor
+        if self.demo_buffer is not None:
+            try:
+                # If the demo buffer has a to() method, move it to the correct device
+                if hasattr(self.demo_buffer, 'to'):
+                    self.demo_buffer = self.demo_buffer.to(self.device)
+                # If it's a dictionary of tensors, move each tensor
+                elif isinstance(self.demo_buffer, dict):
+                    for key in self.demo_buffer:
+                        if isinstance(self.demo_buffer[key], torch.Tensor):
+                            self.demo_buffer[key] = self.demo_buffer[key].to(self.device)
+            except Exception as e:
+                print(f"Warning: Could not move demo buffer to device {self.device}: {e}")
+
+    def _compute_bc_loss(self, obs_batch, action_batch):
+        """Compute behavior cloning loss from demonstrations"""
+        try:
+            # First convert numpy arrays to tensors if needed
+            if isinstance(obs_batch, np.ndarray):
+                obs_tensor = torch.FloatTensor(obs_batch)
+            else:
+                obs_tensor = obs_batch
+
+            # Ensure actions are converted to Long type for cross-entropy loss
+            if isinstance(action_batch, np.ndarray):
+                # Convert to integer type first if needed
+                if action_batch.dtype in [np.float32, np.float64]:
+                    action_batch = action_batch.astype(np.int64)
+                action_tensor = torch.LongTensor(action_batch)
+            else:
+                # If it's already a tensor, convert to long
+                action_tensor = action_batch.long()
+
+            # Move tensors to the correct device
+            obs_tensor = obs_tensor.to(self.device)
+            action_tensor = action_tensor.to(self.device)
+
+            # Handle dimension mismatch
+            if len(obs_tensor.shape) == 4:  # Batch of images
+                # First resize spatial dimensions if needed
+                target_size = (84, 84)  # Increased target size to ensure enough resolution
+                if obs_tensor.shape[2:] != target_size:
+                    obs_tensor = F.interpolate(obs_tensor, size=target_size, mode='bilinear', align_corners=False)
+
+                # Then handle channel dimension
+                if obs_tensor.shape[1] == 1:  # Single channel (grayscale)
+                    obs_tensor = obs_tensor.repeat(1, 12, 1, 1)
+                elif obs_tensor.shape[1] == 3:  # RGB
+                    obs_tensor = obs_tensor.repeat(1, 4, 1, 1)
+                elif obs_tensor.shape[1] == 4:  # 4 channels
+                    obs_tensor = obs_tensor.repeat(1, 3, 1, 1)
+                else:
+                    raise ValueError(f"Unexpected number of channels: {obs_tensor.shape[1]}")
+
+            # Forward pass to get policy logits
+            if self.use_recurrent:
+                policy_logits, _, _ = self.model(obs_tensor)
+            else:
+                policy_logits, _ = self.model(obs_tensor)
+
+            # Ensure action tensor is properly shaped for cross entropy
+            if len(action_tensor.shape) > 1:
+                action_tensor = action_tensor.squeeze()
+
+            # Cross-entropy loss between expert actions and policy
+            bc_loss = F.cross_entropy(policy_logits, action_tensor)
+
+            return bc_loss
+        except Exception as e:
+            print(f"Error in _compute_bc_loss: {e}")
+            import traceback
+            traceback.print_exc()
+            # Return zero loss to avoid breaking training
+            return torch.tensor(0.0, device=self.device)
+
+    def update(self, states, actions, old_log_probs, returns, advantages, dones=None):
+        """Update policy using both demonstrations and online experience."""
+        metrics = {}
+        
+        # Convert inputs to tensors
+        states = torch.FloatTensor(states).to(self.device)
+        actions = torch.LongTensor(actions).to(self.device)
+        old_log_probs = torch.FloatTensor(old_log_probs).to(self.device)
+        returns = torch.FloatTensor(returns).to(self.device)
+        advantages = (advantages - advantages.mean()) / (advantages.std() + 1e-8)
+        advantages = torch.FloatTensor(advantages).to(self.device)
+
+        # Initialize tracking variables
+        total_policy_loss = 0
+        total_value_loss = 0
+        total_entropy = 0
+        total_kl = 0
+        num_updates = 0
+
+        for epoch in range(self.epochs):
+            # Sample demonstrations at the start of each epoch
+            if self.demo_buffer and self.bc_weight > 0:
+                try:
+                    demo_batch = self.demo_buffer.sample(self.demo_batch_size)
+                    demo_obs = demo_batch["observations"]
+                    demo_actions = demo_batch["actions"]
+                except Exception as e:
+                    print(f"Error sampling from demo buffer: {e}")
+                    demo_obs = None
+                    demo_actions = None
+
+            # Get current policy and value predictions
+            if self.use_recurrent:
+                policy_logits, values, _ = self.model(states)
+            else:
+                policy_logits, values = self.model(states)
+            
+            # Compute policy loss components
+            dist = torch.distributions.Categorical(logits=policy_logits)
+            new_log_probs = dist.log_prob(actions)
+            entropy = dist.entropy().mean()
+            
+            # Compute policy ratio and clipped objective
+            ratio = torch.exp(new_log_probs - old_log_probs)
+            surr1 = ratio * advantages
+            surr2 = torch.clamp(ratio, 1.0 - self.clip_eps, 1.0 + self.clip_eps) * advantages
+            policy_loss = -torch.min(surr1, surr2).mean()
+            
+            # Compute value loss
+            value_loss = F.mse_loss(values.squeeze(), returns) * self.vf_coef
+            
+            # Compute entropy loss
+            entropy_loss = -self.ent_reg * entropy
+
+            # First backward pass for policy and value losses
+            loss = policy_loss + value_loss + entropy_loss
+            self.optimizer.zero_grad()
+            loss.backward()
+
+            # Compute behavior cloning loss separately
+            if demo_obs is not None and demo_actions is not None:
+                self.optimizer.zero_grad()
+                bc_loss = self._compute_bc_loss(demo_obs, demo_actions)
+                if isinstance(bc_loss, torch.Tensor) and bc_loss.requires_grad:
+                    bc_weight = self.bc_weight * (0.99 ** self.demo_updates)
+                    (bc_weight * bc_loss).backward()
+                    metrics['bc_loss'] = bc_loss.item()
+            
+            # Apply gradient clipping and optimization step
+            torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.max_grad_norm)
+            self.optimizer.step()
+
+            # Compute KL divergence for early stopping
+            with torch.no_grad():
+                kl = torch.mean((new_log_probs - old_log_probs).exp() - 1 - (new_log_probs - old_log_probs))
+                
+                # Update running averages
+                total_policy_loss += policy_loss.item()
+                total_value_loss += value_loss.item()
+                total_entropy += entropy.item()
+                total_kl += kl.item()
+                num_updates += 1
+
+                # Early stopping if KL divergence is too high
+                if kl > self.target_kl * 4:
+                    print(f"Early stopping at epoch {epoch+1}/{self.epochs} due to KL divergence {kl.item():.4f}")
+                    break
+
+        # Update metrics with averages
+        metrics.update({
+            'policy_loss': total_policy_loss / num_updates if num_updates > 0 else 0,
+            'value_loss': total_value_loss / num_updates if num_updates > 0 else 0,
+            'entropy': total_entropy / num_updates if num_updates > 0 else 0,
+            'kl': total_kl / num_updates if num_updates > 0 else 0,
+            'learning_rate': self.optimizer.param_groups[0]['lr']
+        })
+
+        # Update learning rate
+        if self.scheduler is not None:
+            self.scheduler.step()
+        
+        self.demo_updates += 1
+        return metrics

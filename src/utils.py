@@ -8,6 +8,456 @@ from datetime import datetime
 import json
 import warnings
 
+# Import config
+from config import NETWORK_CONFIG
+
+class ConsoleLogger:
+    """
+    Enhanced console logger that also writes to a file.
+    """
+    def __init__(self, log_dir, filename="training_log.txt"):
+        import os
+        import sys
+        import time
+        
+        os.makedirs(log_dir, exist_ok=True)
+        self.log_file = os.path.join(log_dir, filename)
+        self.terminal = sys.stdout
+        
+        # Create or clear the log file
+        with open(self.log_file, 'w') as f:
+            f.write(f"=== Training Log - Started at {time.strftime('%Y-%m-%d %H:%M:%S')} ===\n\n")
+        
+        # Redirect stdout
+        sys.stdout = self
+    
+    def write(self, message):
+        # Write to terminal
+        self.terminal.write(message)
+        
+        # Write to log file
+        with open(self.log_file, 'a') as f:
+            f.write(message)
+    
+    def flush(self):
+        # Needed for compatibility
+        self.terminal.flush()
+    
+    def close(self):
+        import sys
+        import time
+        
+        # Restore original stdout
+        sys.stdout = self.terminal
+        
+        # Add final timestamp
+        with open(self.log_file, 'a') as f:
+            f.write(f"\n=== Log Ended at {time.strftime('%Y-%m-%d %H:%M:%S')} ===\n")
+
+def validate_parameters(args):
+    """
+    Validate command line arguments and provide warnings for potential issues.
+    
+    Args:
+        args: Command line arguments
+        
+    Returns:
+        args: Potentially modified arguments
+    """
+    warnings = []
+    
+    # Check environment path
+    if args.env_path is None:
+        warnings.append("Environment path not specified. Will use default if available.")
+    elif not os.path.exists(args.env_path):
+        warnings.append(f"Environment executable not found at {args.env_path}")
+    
+    # Check network architecture
+    if args.network not in ["cnn", "resnet", "lstm", "dual"]:
+        warnings.append(f"Unknown network architecture: {args.network}. Will use 'cnn'.")
+        args.network = "cnn"
+    
+    # Check demo path if demos are enabled
+    if not args.no_demos and not os.path.exists(args.demo_path):
+        warnings.append(f"Demonstration file not found: {args.demo_path}")
+    
+    # Check timestep-related parameters
+    if args.eval_freq >= args.timesteps:
+        warnings.append(f"Evaluation frequency ({args.eval_freq}) is >= total timesteps ({args.timesteps})")
+        args.eval_freq = args.timesteps // 10
+        warnings.append(f"Setting evaluation frequency to {args.eval_freq}")
+    
+    if args.save_freq >= args.timesteps:
+        warnings.append(f"Save frequency ({args.save_freq}) is >= total timesteps ({args.timesteps})")
+        args.save_freq = args.timesteps // 5
+        warnings.append(f"Setting save frequency to {args.save_freq}")
+    
+    # Check buffer size and memory usage
+    obs_size_estimate = 42 * 42 * 168  # Conservative estimate based on error message
+    memory_per_transition = obs_size_estimate * 4 * 2  # float32 bytes * 2 (obs + next_obs)
+    estimated_memory_gb = (args.buffer_size * memory_per_transition) / (1024**3)
+    
+    if estimated_memory_gb > 16:  # Assume 16GB as reasonable upper limit
+        warnings.append(f"Buffer size {args.buffer_size} may require ~{estimated_memory_gb:.1f} GB of memory")
+        if not args.memory_efficient:
+            warnings.append("Consider using --memory-efficient flag or reducing --buffer-size")
+    
+    # Check compatibility of memory-efficient mode with RND
+    if args.memory_efficient and not args.no_rnd and not args.force_no_rnd:
+        warnings.append("Memory-efficient mode may cause issues with RND due to observation shape changes")
+        warnings.append("Consider using --force-no-rnd with --memory-efficient mode")
+    
+    # Print warnings
+    if warnings:
+        print("\nWarnings:")
+        for warning in warnings:
+            print(f"- {warning}")
+        print()
+    
+    return args
+
+
+def setup_network_architecture(network_type, obs_shape):
+    """
+    Set up the network architecture based on the specified type.
+    
+    Args:
+        network_type: Type of network architecture ("cnn", "resnet", "lstm", "dual")
+        obs_shape: Observation shape
+        
+    Returns:
+        dict: Policy kwargs for the SAC agent
+    """
+    policy_kwargs = {
+        "normalize_images": False,  # Images are already normalized and in channel-first format
+    }
+    
+    if network_type == "cnn":
+        # Use default CNN from stable-baselines3
+        return policy_kwargs
+    
+    try:
+        # Import feature extractor classes
+        from src.models.networks import feature_extractors
+        
+        # Set up custom feature extractor
+        policy_kwargs["features_extractor_class"] = feature_extractors[network_type]
+        policy_kwargs["features_extractor_kwargs"] = {"features_dim": NETWORK_CONFIG["hidden_dim"]}
+        
+        # Special handling for specific network types
+        if network_type == "lstm":
+            policy_kwargs["features_extractor_kwargs"]["lstm_hidden_size"] = 256
+            policy_kwargs["features_extractor_kwargs"]["lstm_layers"] = 1
+        elif network_type == "dual":
+            policy_kwargs["features_extractor_kwargs"]["state_dim"] = 8
+        elif network_type == "resnet":
+            # You can add specific ResNet configurations here if needed
+            pass
+            
+    except (ImportError, KeyError) as e:
+        print(f"Error setting up network architecture: {e}")
+        print("Falling back to default CNN architecture")
+        # Reset to default
+        policy_kwargs = {
+            "normalize_images": False,
+        }
+    
+    return policy_kwargs
+
+
+class MemoryEfficientObservationWrapper(gym.ObservationWrapper):
+    """
+    Wrapper to reduce memory usage of observations.
+    
+    Reduces resolution and converts RGB to grayscale if needed.
+    """
+    def __init__(self, env, width=32, height=32, grayscale=True, max_frames=4, debug=False, preserve_obs_shape=False):
+        super().__init__(env)
+        self.width = width
+        self.height = height
+        self.grayscale = grayscale
+        self.max_frames = max_frames
+        self.debug = debug
+        self.preserve_obs_shape = preserve_obs_shape  # Use consistent naming throughout
+        
+        # Import necessary modules
+        from gym import spaces
+        
+        # Determine new observation space
+        old_shape = env.observation_space.shape
+        
+        if self.debug:
+            print(f"Original observation space shape: {old_shape}")
+        
+        # If preserving shape type, maintain the same dimensions but reduce resolution
+        if preserve_obs_shape:
+            if len(old_shape) == 3 and old_shape[0] <= 10:  # Probably frame stacked (frames, height, width)
+                frames = old_shape[0]
+                new_shape = (frames, height, width)
+            elif len(old_shape) == 3:  # Probably (height, width, channels)
+                channels = 1 if grayscale else old_shape[2]
+                new_shape = (height, width, channels)
+            elif len(old_shape) == 4:  # Probably (frames, height, width, channels)
+                frames = old_shape[0]
+                channels = 1 if grayscale else old_shape[3] 
+                new_shape = (frames, height, width, channels)
+            else:
+                new_shape = old_shape
+                print(f"WARNING: Cannot preserve shape type for {old_shape}. Using as is.")
+        else:
+            # Determine observation format for standard memory-efficient mode
+            if len(old_shape) == 3:
+                # For (height, width, channels) OR (frames, height, width)
+                if old_shape[0] <= 10:  # Likely frame stacked
+                    # Convert to standard format with channels
+                    frames = old_shape[0]
+                    new_shape = (frames, height, width, 1 if grayscale else 3)
+                else:
+                    # Regular image
+                    channels = 1 if grayscale else old_shape[2]
+                    new_shape = (height, width, channels)
+            elif len(old_shape) == 4:
+                # Already (frames, height, width, channels)
+                frames = old_shape[0]
+                channels = 1 if grayscale else old_shape[3]
+                new_shape = (frames, height, width, channels)
+            else:
+                print(f"WARNING: Unexpected observation shape: {old_shape}. Keeping as is.")
+                new_shape = old_shape
+            
+        self.observation_space = spaces.Box(
+            low=0, high=255, 
+            shape=new_shape, 
+            dtype=np.uint8
+        )
+        
+        # Store shape information for processing
+        self.input_shape = old_shape
+        self.output_shape = new_shape
+        
+        print(f"MemoryEfficientWrapper: Input shape {old_shape} -> Output shape {new_shape}")
+        if preserve_obs_shape:
+            print("  (Preserving shape dimensions while reducing resolution)")
+        
+    def observation(self, obs):
+        """Process observation"""
+        # Safety check
+        if obs is None:
+            return None
+            
+        try:
+            import cv2
+            
+            if self.debug:
+                print(f"Received observation with shape: {obs.shape}, dtype: {obs.dtype}")
+            
+            # Handle different observation formats based on preserve_obs_shape flag
+            input_shape = obs.shape
+            
+            # Special handling for preserve_obs_shape
+            if self.preserve_obs_shape:
+                # For frame stacked observations (frames, height, width)
+                if len(input_shape) == 3 and input_shape[0] <= 10:
+                    frames = input_shape[0]
+                    # Reshape but keep dimensions the same
+                    processed = np.zeros((frames, self.height, self.width), dtype=np.uint8)
+                    
+                    for i in range(frames):
+                        frame = obs[i]
+                        # Resize
+                        processed[i] = cv2.resize(frame, (self.width, self.height), 
+                                             interpolation=cv2.INTER_AREA)
+                    
+                    return processed
+                    
+                # For regular images (height, width, channels)
+                elif len(input_shape) == 3 and input_shape[0] > 10:
+                    # Regular image, just resize
+                    resized = cv2.resize(obs, (self.width, self.height), 
+                                    interpolation=cv2.INTER_AREA)
+                    
+                    if self.grayscale and input_shape[2] > 1:
+                        resized = cv2.cvtColor(resized, cv2.COLOR_RGB2GRAY)
+                        
+                    return resized
+                    
+                # For stacked frames with channels (frames, height, width, channels)
+                elif len(input_shape) == 4:
+                    frames = input_shape[0]
+                    channels = 1 if self.grayscale else input_shape[3]
+                    processed = np.zeros((frames, self.height, self.width, channels), dtype=np.uint8)
+                    
+                    for i in range(frames):
+                        frame = obs[i]
+                        # Resize
+                        resized = cv2.resize(frame, (self.width, self.height), 
+                                        interpolation=cv2.INTER_AREA)
+                        
+                        if self.grayscale and input_shape[3] > 1:
+                            resized = cv2.cvtColor(resized, cv2.COLOR_RGB2GRAY)
+                            resized = resized[..., np.newaxis]
+                            
+                        processed[i] = resized
+                        
+                    return processed
+                
+                # If unknown shape, return as is
+                return obs
+                
+            # Standard processing (not preserving shape type)
+            # For observations shaped like (frames, height, width)
+            if len(input_shape) == 3 and input_shape[0] < 10:
+                frames, height, width = input_shape
+                
+                # Reshape to expected format with channel dimension
+                processed = np.zeros((frames, self.height, self.width, 1), dtype=np.uint8)
+                
+                for i in range(frames):
+                    # Get frame and add channel dimension if needed
+                    frame = obs[i]
+                    frame = cv2.resize(frame, (self.width, self.height), interpolation=cv2.INTER_AREA)
+                    
+                    # Ensure correct shape
+                    if len(frame.shape) == 2:  # If grayscale
+                        frame = frame[..., np.newaxis]
+                        
+                    processed[i] = frame
+                
+                return processed
+                
+            # For RGB or grayscale images (height, width, channels)
+            elif len(input_shape) == 3 and input_shape[2] <= 4:
+                # Standard RGB/grayscale image
+                resized = cv2.resize(obs, (self.width, self.height), interpolation=cv2.INTER_AREA)
+                
+                if self.grayscale and input_shape[2] > 1:
+                    grayscale = cv2.cvtColor(resized, cv2.COLOR_RGB2GRAY)
+                    return grayscale[..., np.newaxis]
+                
+                return resized
+                
+            # For frame-stacked observations (frames, height, width, channels)
+            elif len(input_shape) == 4:
+                frames, height, width, channels = input_shape
+                processed = np.zeros((frames, self.height, self.width, 
+                                   1 if self.grayscale else channels), 
+                                   dtype=np.uint8)
+                
+                for i in range(frames):
+                    frame = obs[i]
+                    resized = cv2.resize(frame, (self.width, self.height), interpolation=cv2.INTER_AREA)
+                    
+                    if self.grayscale and channels > 1:
+                        gray = cv2.cvtColor(resized, cv2.COLOR_RGB2GRAY)
+                        processed[i] = gray[..., np.newaxis]
+                    else:
+                        processed[i] = resized
+                        
+                return processed
+                
+            # For special case (4, 42, 168) handle specially
+            elif len(input_shape) == 3 and input_shape[0] < 10 and input_shape[2] > 10:
+                if self.debug:
+                    print(f"Special case handling for shape {input_shape}")
+                    
+                frames, height, features = input_shape
+                
+                # Create a fallback array with proper dimensions for policy
+                return np.zeros((frames, self.height, self.width, 1), dtype=np.uint8)
+                
+            else:
+                # Unknown format - create a zeros array with proper shape
+                print(f"WARNING: Unhandled observation shape: {input_shape}. Creating empty array.")
+                return np.zeros(self.output_shape, dtype=np.uint8)
+                
+        except Exception as e:
+            print(f"Error processing observation: {e}")
+            print(f"Observation shape: {input_shape}")
+            # Return zero array as fallback
+            return np.zeros(self.output_shape, dtype=np.uint8)
+
+
+def create_memory_efficient_env(env, width=32, height=32, debug=False, preserve_obs_shape=False):
+    """
+    Apply memory-efficient wrappers to an environment.
+    
+    Args:
+        env: Environment to wrap
+        width: Width to resize observations to
+        height: Height to resize observations to
+        debug: Whether to print debug information
+        preserve_obs_shape: Whether to preserve original shape dimensions
+        
+    Returns:
+        Wrapped environment
+    """
+    # Print original observation space for debugging
+    if debug:
+        if hasattr(env, 'observation_space'):
+            print(f"Original observation space: {env.observation_space}")
+            if hasattr(env.observation_space, 'shape'):
+                print(f"Original shape: {env.observation_space.shape}")
+                
+                # If this is a vector environment, try to access the base environment
+                if hasattr(env, 'envs') and len(env.envs) > 0:
+                    print(f"Base env observation space: {env.envs[0].observation_space}")
+    
+    # Create wrapper
+    wrapped_env = MemoryEfficientObservationWrapper(
+        env, 
+        width=width, 
+        height=height, 
+        grayscale=True, 
+        debug=debug,
+        preserve_obs_shape=preserve_obs_shape
+    )
+    
+    return wrapped_env
+
+
+def create_experiment_name(args):
+    """
+    Create a descriptive experiment name based on the configuration.
+    
+    Args:
+        args: Command line arguments
+        
+    Returns:
+        str: Experiment name
+    """
+    components = ["demosac"]
+    
+    # Add network type
+    components.append(args.network)
+    
+    # Add demo info
+    if not args.no_demos:
+        components.append("demo")
+    
+    # Add RND info
+    if not args.no_rnd:
+        components.append(f"rnd{args.rnd_coef}")
+    
+    # Add custom wrapper info
+    if args.use_custom_wrappers:
+        wrapper_name = "custom"
+        if args.reward_shaping:
+            wrapper_name += "_shaped"
+        components.append(wrapper_name)
+    
+    # Add memory efficiency info
+    if args.memory_efficient:
+        components.append("memeff")
+    
+    # Join components
+    name = "_".join(components)
+    
+    # Add timestamp
+    import time
+    timestamp = time.strftime("%Y%m%d_%H%M%S")
+    
+    return f"{name}_{timestamp}"
+
 def to_python_type(value):
     """Convert NumPy or Torch types to Python native types"""
     if isinstance(value, np.ndarray):

@@ -501,6 +501,31 @@ def debug_print(logger, *args, **kwargs):
         message = " ".join(map(str, args))
         logger.debug(message)
 
+def load_demonstration_buffer(path, logger=None):
+    """Load demonstration buffer from a file"""
+    if logger:
+        logger.log_event("DEMOS", f"Loading demonstrations from {path}")
+    
+    try:
+        from src.sac_utils.demo_buffer import DemonstrationBuffer
+        demo_buffer = DemonstrationBuffer()
+        demo_buffer.load(path)
+        
+        if logger:
+            logger.log_event("DEMOS", f"Loaded {demo_buffer.total_transitions} transitions from {demo_buffer.num_episodes} episodes")
+            
+            # Log demo statistics if available
+            stats = demo_buffer.get_statistics()
+            if stats:
+                for key, value in stats.items():
+                    logger.log_event("DEMOS", f"{key}: {value}")
+        
+        return demo_buffer
+    except Exception as e:
+        if logger:
+            logger.error(f"Failed to load demonstration buffer: {e}")
+        return None
+
 # Simplified reward shaping function
 def shape_reward(reward, info, action, prev_info=None, prev_keys=None, episodic_memory=None, current_floor=0):
     """Apply simplified reward shaping"""
@@ -527,7 +552,7 @@ def shape_reward(reward, info, action, prev_info=None, prev_keys=None, episodic_
     current_keys = info.get("total_keys", 0)
     if prev_keys is not None and current_keys > prev_keys:
         print(f"KEY COLLECTED! prev={prev_keys}, current={current_keys}")
-        key_bonus = 5.0  # Was 1.0
+        key_bonus = 3.0  # Was 1.0
         shaped_reward += key_bonus
         reward_components['key_bonus'] = key_bonus
         
@@ -538,7 +563,7 @@ def shape_reward(reward, info, action, prev_info=None, prev_keys=None, episodic_
     
     # 3. Door opening bonus (key usage)
     if prev_keys is not None and current_keys < prev_keys:
-        door_bonus = 10.0  # Was 2.0
+        door_bonus = 7.0  # Was 2.0
         shaped_reward += door_bonus
         reward_components['door_bonus'] = door_bonus
         
@@ -714,7 +739,7 @@ def main(args):
         ent_reg=0.01,                 # More conservative entropy regularization
         max_grad_norm=0.5,           
         target_kl=0.025,              # Reduced target KL for more conservative updates
-        lr_scheduler='linear',       
+        lr_scheduler='cosine',       
         adaptive_entropy=True,       
         min_entropy=0.005,            # Higher minimum entropy to ensure exploration
         entropy_decay_factor=0.9999,  # Slower entropy decay
@@ -731,6 +756,54 @@ def main(args):
         use_recurrent=args.use_lstm,
         recurrent_seq_len=args.sequence_length if hasattr(args, 'sequence_length') and args.sequence_length is not None else 16,  # Longer sequences
     )
+    demo_buffer = None
+    if args.use_demos:
+        demo_path = args.demo_path
+        if os.path.exists(demo_path):
+            demo_buffer = load_demonstration_buffer(demo_path, logger)
+            if demo_buffer:
+                logger.log_event("DEMOS", "Successfully loaded demonstrations")
+                
+                # Replace PPO agent with DemoPPO agent
+                from src.ppo import DemoPPO
+                ppo_agent = DemoPPO(
+                    model=model,
+                    lr=args.lr, 
+                    clip_eps=args.clip_eps,
+                    gamma=args.gamma,
+                    gae_lambda=args.gae_lambda,
+                    epochs=args.epochs,
+                    batch_size=args.batch_size,
+                    vf_coef=args.vf_coef,
+                    ent_reg=args.entropy_reg,
+                    max_grad_norm=args.max_grad_norm,
+                    target_kl=args.target_kl,
+                    lr_scheduler='linear',
+                    adaptive_entropy=True,
+                    min_entropy=0.005,
+                    entropy_decay_factor=0.9999,
+                    update_adv_batch_norm=True,
+                    entropy_boost_threshold=0.001,
+                    lr_reset_interval=100,
+                    use_icm=args.use_icm,
+                    icm_lr=5e-5,
+                    icm_reward_scale=0.01,
+                    icm_forward_weight=0.2,
+                    icm_inverse_weight=0.8,
+                    icm_feature_dim=256,
+                    device=device,
+                    use_recurrent=args.use_lstm,
+                    recurrent_seq_len=args.sequence_length,
+                    demo_buffer=demo_buffer,
+                    bc_weight=args.bc_weight,
+                    demo_batch_size=args.demo_batch_size,
+                    demo_sampling_ratio=args.demo_sampling_ratio
+                )
+                logger.log_event("DEMOS", f"Created DemoPPO agent with BC weight {args.bc_weight}")
+            else:
+                logger.error(f"Could not load demonstrations from {demo_path}")
+        else:
+            logger.error(f"Demonstration file not found: {demo_path}")
     
     # Log hyperparameters to TensorBoard
     hyperparams = {
@@ -941,53 +1014,73 @@ def main(args):
                     
                     # More aggressive floor advancement
                     # Check if agent reached or exceeded target floor
-                    if floor_reached > current_curriculum_floor:
+                    if floor_reached >= current_curriculum_floor:
                         curriculum_successes += 1
                         curriculum_success_streak += 1
                         
                         # Record as success for this floor
-                        curriculum_floor_success_history[floor_reached]['successes'] += 1
+                        if floor_reached in curriculum_floor_success_history:
+                            curriculum_floor_success_history[floor_reached]['successes'] += 1
                         
-                        success_rate = curriculum_floor_success_history[floor_reached]['successes'] / \
-                                       curriculum_floor_success_history[floor_reached]['attempts']
+                        # Calculate success rate for current floor
+                        success_rate = curriculum_floor_success_history[current_curriculum_floor]['successes'] / \
+                                     curriculum_floor_success_history[current_curriculum_floor]['attempts'] \
+                                     if current_curriculum_floor in curriculum_floor_success_history else 0
                         
-                        # Make curriculum advancement more generous
-                        # If success rate is good or we have a success streak, increase difficulty
-                        if optimization_steps == 5:
-                            logger.log_event("DIAGNOSTIC", "Testing policy after initial updates")
-                            with torch.no_grad():
-                                # Sample a few actions and print probabilities
-                                test_state = torch.FloatTensor(state).unsqueeze(0).to(device)
-                                policy_logits = model(test_state)
-                                probs = F.softmax(policy_logits, dim=1)
-                                logger.log_event("DIAGNOSTIC", f"Action probs: {probs.cpu().numpy()}")
+                        # Stricter curriculum advancement criteria
+                        if current_curriculum_floor < 2:
+                            # Moderate for floors 0-1
+                            success_threshold = 0.6  # Increased from 0.3
+                            min_attempts = 10       # Increased from 2
+                            streak_required = 3     # Increased from 1
+                        elif current_curriculum_floor < 4:
+                            # Strict for floors 2-3
+                            success_threshold = 0.7  # Increased from 0.5
+                            min_attempts = 15       # Increased from 3
+                            streak_required = 4     # Increased from 2
+                        else:
+                            # Very strict for higher floors
+                            success_threshold = 0.8  # Increased from 0.6
+                            min_attempts = 20       # Increased from 4
+                            streak_required = 5     # Increased from 3
 
-                        if (success_rate > 0.5 and curriculum_floor_success_history[floor_reached]['attempts'] >= 3) or \
-                           (curriculum_success_streak >= 2):
+                        # Only advance if we have consistent success on the current floor
+                        if current_curriculum_floor in curriculum_floor_success_history and \
+                           curriculum_floor_success_history[current_curriculum_floor]['attempts'] >= min_attempts and \
+                           ((success_rate >= success_threshold) or (curriculum_success_streak >= streak_required)):
+                            
                             if curriculum_config['max_floor'] < 10:  # Cap at floor 10 for now
                                 curriculum_config['max_floor'] += 1
-                            current_curriculum_floor += 1
-                            
-                            # Log curriculum advancement
-                            curriculum_msg = f"Advancing curriculum to floor {current_curriculum_floor}"
-                            logger.log_event("CURRICULUM", curriculum_msg)
-                            
-                            # Boost entropy when curriculum advances to encourage exploration
-                            old_entropy = ppo_agent.ent_reg
-                            ppo_agent.ent_reg = min(0.1, ppo_agent.ent_reg * 1.5)
-                            logger.log_event("ENTROPY", 
-                                f"Boosting entropy from {old_entropy:.4f} to {ppo_agent.ent_reg:.4f} for new floor exploration")
+                                current_curriculum_floor += 1
+                                
+                                # Log curriculum advancement with detailed stats
+                                curriculum_msg = (
+                                    f"Advancing curriculum to floor {current_curriculum_floor}\n"
+                                    f"Success rate: {success_rate:.2f}, Attempts: {curriculum_floor_success_history[current_curriculum_floor-1]['attempts']}, "
+                                    f"Success streak: {curriculum_success_streak}"
+                                )
+                                logger.log_event("CURRICULUM", curriculum_msg)
+                                
+                                # Boost entropy when curriculum advances to encourage exploration
+                                old_entropy = ppo_agent.ent_reg
+                                ppo_agent.ent_reg = min(0.05, ppo_agent.ent_reg * 1.2)
+                                logger.log_event("ENTROPY", 
+                                    f"Boosting entropy from {old_entropy:.4f} to {ppo_agent.ent_reg:.4f} for new floor exploration")
                     else:
                         curriculum_success_streak = 0
                         
-                    # If consistently failing at current floor, occasionally practice easier floors
-                    if curriculum_attempts % 5 == 0 and curriculum_success_streak == 0:
-                        # Temporarily reduce floor to build skills
-                        practice_floor = max(0, current_curriculum_floor - 1)
-                        logger.log_event("CURRICULUM", 
-                            f"Temporarily practicing on floor {practice_floor} to build skills")
-                        if hasattr(env, 'floor'):
-                            env.floor(practice_floor)
+                    # If consistently failing at current floor, practice easier floors more frequently
+                    if curriculum_attempts % 10 == 0 and curriculum_success_streak == 0:  # Check less frequently
+                        # Only drop back if we've had a significant number of failures
+                        if curriculum_attempts >= 20:  # Require more attempts before dropping
+                            # Temporarily reduce floor to build skills
+                            practice_floor = max(0, current_curriculum_floor - 1)
+                            logger.log_event("CURRICULUM", 
+                                f"After {curriculum_attempts} attempts with no success, dropping to floor {practice_floor} to rebuild skills")
+                            if hasattr(env, 'floor'):
+                                env.floor(practice_floor)
+                                # Reset attempt counter to give enough time on the practice floor
+                                curriculum_attempts = 10  # Start halfway to give some learning time
                 
                 # Set floor based on curriculum
                 # For simplicity, just use the current curriculum floor
@@ -1048,6 +1141,13 @@ def main(args):
         # Reset LSTM state at the beginning of each episode if using recurrent policy
         if args.use_lstm:
             ppo_agent.reset_lstm_state()
+
+        # ADD SEED ROTATION HERE
+        seed_list = [42, 123]  # Different seeds
+        current_seed = seed_list[episode_count % len(seed_list)]
+        env.seed(current_seed)
+        torch.manual_seed(current_seed)
+        np.random.seed(current_seed)
         
         # Collect trajectory
         steps_this_episode = 0
@@ -1425,7 +1525,10 @@ def main(args):
                 logger.log_event("DIAGNOSTIC", f"Testing policy after {optimization_steps} updates")
                 with torch.no_grad():
                     test_state = torch.FloatTensor(state).unsqueeze(0).to(device)
-                    policy_logits, value = model(test_state)
+                    if args.use_lstm:
+                        policy_logits, value, _ = model(test_state)
+                    else:
+                        policy_logits, value = model(test_state)
                     probs = F.softmax(policy_logits, dim=1)
                     prob_info = {f"action_{i}": float(p) for i, p in enumerate(probs[0].cpu().numpy()) if p > 0.01}
                     logger.log_event("DIAGNOSTIC", f"Action probs: {prob_info}")
@@ -1448,7 +1551,7 @@ def main(args):
                     if max_recent_floor <= 2:
                         # We're stuck on early floors - increase entropy temporarily
                         old_entropy = ppo_agent.ent_reg
-                        ppo_agent.ent_reg = min(0.1, ppo_agent.ent_reg * 1.5)  # Increase entropy up to 0.1
+                        ppo_agent.ent_reg = min(0.05, ppo_agent.ent_reg * 1.2)  # Changed from 0.1 and 1.5
                         logger.log_event("TUNING", f"Increasing entropy from {old_entropy:.4f} to {ppo_agent.ent_reg:.4f} to escape floor {max_recent_floor}")
                 
             # Clear replay buffer after update
@@ -1823,6 +1926,17 @@ if __name__ == "__main__":
                         help='Number of training steps')
     parser.add_argument('--curriculum', action='store_true',
                         help='Use curriculum learning to gradually increase difficulty')
+    
+    parser.add_argument('--use_demos', action='store_true',
+                        help='Use demonstrations to guide learning')
+    parser.add_argument('--demo_path', type=str, default="demonstrations/demonstrations.pkl",
+                        help='Path to demonstration buffer file')
+    parser.add_argument('--bc_weight', type=float, default=0.1,
+                        help='Weight for behavior cloning loss')
+    parser.add_argument('--demo_batch_size', type=int, default=64,
+                        help='Batch size for demonstration sampling')
+    parser.add_argument('--demo_sampling_ratio', type=float, default=0.25,
+                        help='Ratio of demonstration data to online data')
     
     # PPO hyperparameters
     parser.add_argument('--lr', type=float, default=1e-4,  # Updated default learning rate
