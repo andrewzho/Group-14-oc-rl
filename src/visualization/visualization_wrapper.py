@@ -18,7 +18,8 @@ class VisualizationWrapper(gym.Wrapper):
     """
     
     def __init__(self, env, save_dir='./agent_videos', max_queue_size=100, 
-                 record_freq=1, display=False, record_episodes=True):
+                 record_freq=1, display=False, record_episodes=True,
+                 display_width=800, display_height=600, video_quality='high'):
         """
         Initialize the visualization wrapper.
         
@@ -29,12 +30,19 @@ class VisualizationWrapper(gym.Wrapper):
             record_freq: How often to record frames (1 = every frame).
             display: Whether to display frames in real-time.
             record_episodes: Whether to record full episodes.
+            display_width: Width for the display window (default: 800)
+            display_height: Height for the display window (default: 600)
+            video_quality: Quality setting for videos ('low', 'medium', 'high', 'ultra')
+                           'ultra' outputs 1080p resolution videos
         """
         super().__init__(env)
         self.save_dir = save_dir
         self.record_freq = record_freq
         self.display = display
         self.record_episodes = record_episodes
+        self.display_width = display_width
+        self.display_height = display_height
+        self.video_quality = video_quality
         
         # Create directories for saved frames
         os.makedirs(save_dir, exist_ok=True)
@@ -76,10 +84,10 @@ class VisualizationWrapper(gym.Wrapper):
         
         # Try to load a font for annotations
         try:
-            self.font = ImageFont.truetype("arial.ttf", 12)
+            self.font = ImageFont.truetype("arial.ttf", 16)  # Increased font size
         except:
             try:
-                self.font = ImageFont.truetype("FreeSans.ttf", 12)
+                self.font = ImageFont.truetype("FreeSans.ttf", 16)  # Increased font size
             except:
                 self.font = ImageFont.load_default()
 
@@ -150,9 +158,12 @@ class VisualizationWrapper(gym.Wrapper):
             self.episode_rewards.append(reward)
             self.episode_actions.append(action)
             
-            # Save individual frame
+            # Save individual frame with enhanced quality
             if self.episode_dir:
-                frame.save(os.path.join(self.episode_dir, f"frame_{self.step_count:06d}.png"))
+                # Save at a higher resolution for better quality
+                save_frame = frame.resize((frame.width*2, frame.height*2), Image.LANCZOS) 
+                save_frame.save(os.path.join(self.episode_dir, f"frame_{self.step_count:06d}.png"), 
+                                quality=95, optimize=True)  # Higher quality PNG
         
         # Add to display queue if needed
         if self.display:
@@ -172,40 +183,128 @@ class VisualizationWrapper(gym.Wrapper):
         # Create a drawing context
         draw = ImageDraw.Draw(frame)
         
-        # Add action name
+        # Add semi-transparent overlay for text background
+        overlay = Image.new('RGBA', frame.size, (0, 0, 0, 0))
+        overlay_draw = ImageDraw.Draw(overlay)
+        overlay_draw.rectangle([(5, 5), (200, 80)], fill=(0, 0, 0, 128))
+        
+        # Composite the overlay onto the frame
+        if frame.mode == 'RGB':
+            frame = frame.convert('RGBA')
+        frame = Image.alpha_composite(frame, overlay)
+        frame = frame.convert('RGB')
+        
+        draw = ImageDraw.Draw(frame)
+        
+        # Add action name with improved visibility
         action_name = self.action_names.get(action, str(action))
         draw.text((10, 10), f"Action: {action_name}", fill=(255, 255, 255), font=self.font)
         
         # Add reward
-        draw.text((10, 25), f"Reward: {reward:.2f}", fill=(255, 255, 255), font=self.font)
+        draw.text((10, 30), f"Reward: {reward:.2f}", fill=(255, 255, 255), font=self.font)
         
         # Add floor info if available
         if 'current_floor' in info:
-            draw.text((10, 40), f"Floor: {info['current_floor']}", fill=(255, 255, 255), font=self.font)
+            draw.text((10, 50), f"Floor: {info['current_floor']}", fill=(255, 255, 255), font=self.font)
         elif hasattr(self, 'current_floor'):
-            draw.text((10, 40), f"Floor: {self.current_floor}", fill=(255, 255, 255), font=self.font)
+            draw.text((10, 50), f"Floor: {self.current_floor}", fill=(255, 255, 255), font=self.font)
         
         # Add step count
-        draw.text((10, 55), f"Step: {self.step_count}", fill=(255, 255, 255), font=self.font)
+        draw.text((10, 70), f"Step: {self.step_count}", fill=(255, 255, 255), font=self.font)
         
         return frame
     
     def _save_episode(self):
-        """Save the recorded episode as a series of images."""
+        """Save the recorded episode as a series of images and video."""
         print(f"Saving episode {self.episode_count} with {len(self.episode_frames)} frames to {self.episode_dir}")
         
-        # Create a summary text file with episode information
-        with open(os.path.join(self.episode_dir, "episode_summary.txt"), "w") as f:
-            f.write(f"Episode: {self.episode_count}\n")
-            f.write(f"Steps: {self.step_count}\n")
-            f.write(f"Total Reward: {sum(self.episode_rewards):.2f}\n")
-            f.write(f"Max Floor: {self.current_floor}\n")
+        try:
+            import cv2
             
-            # Write step-by-step information
-            f.write("\nStep-by-step details:\n")
-            for i, (action, reward) in enumerate(zip(self.episode_actions, self.episode_rewards)):
-                action_name = self.action_names.get(action, str(action))
-                f.write(f"Step {i+1}: Action={action_name}, Reward={reward:.2f}\n")
+            # Create a summary text file with episode information
+            with open(os.path.join(self.episode_dir, "episode_summary.txt"), "w") as f:
+                f.write(f"Episode: {self.episode_count}\n")
+                f.write(f"Steps: {self.step_count}\n")
+                f.write(f"Total Reward: {sum(self.episode_rewards):.2f}\n")
+                f.write(f"Max Floor: {self.current_floor}\n")
+                
+                # Write step-by-step information
+                f.write("\nStep-by-step details:\n")
+                for i, (action, reward) in enumerate(zip(self.episode_actions, self.episode_rewards)):
+                    action_name = self.action_names.get(action, str(action))
+                    f.write(f"Step {i+1}: Action={action_name}, Reward={reward:.2f}\n")
+            
+            # Save as video with enhanced quality
+            timestamp = datetime.datetime.now().strftime("%Y%m%d-%H%M%S")
+            video_path = os.path.join(self.episode_dir, f"episode_{self.episode_count}_{timestamp}.mp4")
+            
+            # Get video dimensions
+            sample_frame = np.array(self.episode_frames[0])
+            height, width, _ = sample_frame.shape
+            
+            # Determine quality settings based on video_quality parameter
+            if self.video_quality == 'high':
+                target_width, target_height = max(width*2, 640), max(height*2, 480)
+                codec = 'H264'
+                fps = 30
+                bitrate = 5000000  # 5 Mbps
+            elif self.video_quality == 'medium':
+                target_width, target_height = max(width, 480), max(height, 360)
+                codec = 'XVID'
+                fps = 24
+                bitrate = 2000000  # 2 Mbps
+            elif self.video_quality == 'ultra':
+                target_width, target_height = 1920, 1080
+                codec = 'H264'
+                fps = 30
+                bitrate = 8000000  # 8 Mbps for high-quality 1080p
+            else:  # 'low'
+                target_width, target_height = width, height
+                codec = 'mp4v'
+                fps = 20
+                bitrate = 1000000  # 1 Mbps
+            
+            # Try to use the selected codec
+            try:
+                fourcc = cv2.VideoWriter_fourcc(*codec)
+                out = cv2.VideoWriter(video_path, fourcc, fps, (target_width, target_height))
+                
+                # Check if writer is initialized
+                if not out.isOpened():
+                    raise Exception(f"{codec} codec not available")
+                    
+            except Exception as e:
+                print(f"Warning: Codec {codec} not available, falling back to mp4v: {e}")
+                fourcc = cv2.VideoWriter_fourcc(*'mp4v')
+                out = cv2.VideoWriter(video_path, fourcc, fps, (target_width, target_height))
+            
+            # Apply enhanced bitrate if using OpenCV 4.1+
+            try:
+                out.set(cv2.VIDEOWRITER_PROP_QUALITY, 100)  # Maximum quality
+                if hasattr(cv2, 'VIDEOWRITER_PROP_BITRATE'):
+                    out.set(cv2.VIDEOWRITER_PROP_BITRATE, bitrate)
+            except:
+                print("Note: Enhanced bitrate settings not supported in this OpenCV version")
+            
+            # Write frames
+            for frame in self.episode_frames:
+                # Convert PIL Image to numpy if needed
+                if not isinstance(frame, np.ndarray):
+                    frame = np.array(frame)
+                
+                # Resize if needed
+                if width != target_width or height != target_height:
+                    frame = cv2.resize(frame, (target_width, target_height), interpolation=cv2.INTER_LANCZOS4)
+                
+                # Convert RGB to BGR for OpenCV
+                frame_bgr = cv2.cvtColor(frame, cv2.COLOR_RGB2BGR)
+                out.write(frame_bgr)
+            
+            out.release()
+            print(f"Saved {self.video_quality} quality video ({target_width}x{target_height}) to {video_path}")
+            
+        except ImportError:
+            print("OpenCV not available. Cannot save video, only individual frames.")
     
     def _display_loop(self):
         """Display loop for showing frames in real-time."""
@@ -213,12 +312,20 @@ class VisualizationWrapper(gym.Wrapper):
             import cv2
             window_name = "Obstacle Tower Agent"
             cv2.namedWindow(window_name, cv2.WINDOW_NORMAL)
-            cv2.resizeWindow(window_name, 640, 480)
+            cv2.resizeWindow(window_name, self.display_width, self.display_height)
             
             while self.running:
                 try:
                     frame = self.frame_queue.get(timeout=1.0)
-                    frame = cv2.cvtColor(np.array(frame), cv2.COLOR_RGB2BGR)
+                    # Convert to numpy array if it's a PIL Image
+                    if not isinstance(frame, np.ndarray):
+                        frame = np.array(frame)
+                    
+                    # Resize for display
+                    frame = cv2.resize(frame, (self.display_width, self.display_height), 
+                                     interpolation=cv2.INTER_LANCZOS4)
+                    
+                    frame = cv2.cvtColor(frame, cv2.COLOR_RGB2BGR)
                     cv2.imshow(window_name, frame)
                     if cv2.waitKey(1) & 0xFF == ord('q'):
                         break

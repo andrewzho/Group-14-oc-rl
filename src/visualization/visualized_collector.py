@@ -19,7 +19,8 @@ class VisualizedTrajectoryCollector(TensorboardTrajectoryCollector):
     """
     
     def __init__(self, parallel_envs, model, num_steps, visualizer=None, 
-                 display_env_idx=0, video_record_freq=10, display=False, record_video=False):
+                 display_env_idx=0, video_record_freq=10, display=False, record_video=False,
+                 display_width=800, display_height=600, video_quality='high'):
         """
         Initialize the visualized trajectory collector.
         
@@ -32,6 +33,9 @@ class VisualizedTrajectoryCollector(TensorboardTrajectoryCollector):
             video_record_freq: How often to record full episode videos (default: every 10 episodes).
             display: Whether to display gameplay in a window.
             record_video: Whether to record videos of gameplay.
+            display_width: Width for the display window (default: 800)
+            display_height: Height for the display window (default: 600)
+            video_quality: Quality setting for videos ('low', 'medium', 'high', 'ultra')
         """
         super().__init__(parallel_envs, model, num_steps)
         self.visualizer = visualizer
@@ -39,6 +43,9 @@ class VisualizedTrajectoryCollector(TensorboardTrajectoryCollector):
         self.video_record_freq = video_record_freq
         self.display = display
         self.record_video = record_video
+        self.display_width = display_width
+        self.display_height = display_height
+        self.video_quality = video_quality
         
         # Setup for visualization
         if display or record_video:
@@ -71,7 +78,7 @@ class VisualizedTrajectoryCollector(TensorboardTrajectoryCollector):
         if self.display:
             self.window_name = "Obstacle Tower Agent"
             cv2.namedWindow(self.window_name, cv2.WINDOW_NORMAL)
-            cv2.resizeWindow(self.window_name, 640, 480)
+            cv2.resizeWindow(self.window_name, self.display_width, self.display_height)
     
     def reset(self):
         """Reset environments and prepare for visualization."""
@@ -239,14 +246,62 @@ class VisualizedTrajectoryCollector(TensorboardTrajectoryCollector):
             
         height, width, layers = self.episode_frames[0].shape
         
-        # Create video writer
-        fourcc = cv2.VideoWriter_fourcc(*'mp4v')
-        video = cv2.VideoWriter(filename, fourcc, 30, (width, height))
+        # Set quality parameters based on video_quality setting
+        if self.video_quality == 'high':
+            # Higher quality video output using H.264 codec with quality parameters
+            fourcc = cv2.VideoWriter_fourcc(*'H264')  # Higher quality codec
+            fps = 30
+            scale_factor = min(2.0, max(640/width, 480/height))  # Upscale to at least 640x480, but no more than 2x
+            bitrate = 5000000  # 5 Mbps
+        elif self.video_quality == 'medium':
+            # Medium quality with XVID codec
+            fourcc = cv2.VideoWriter_fourcc(*'XVID')
+            fps = 24
+            scale_factor = min(1.5, max(480/width, 360/height))  # Medium upscaling
+            bitrate = 2000000  # 2 Mbps
+        elif self.video_quality == 'ultra':
+            # Ultra quality with 1080p output
+            fourcc = cv2.VideoWriter_fourcc(*'H264')
+            fps = 30
+            # Calculate scale factor to reach 1080p (1920x1080)
+            scale_factor = min(3.0, max(1920/width, 1080/height))
+            bitrate = 8000000  # 8 Mbps for high-quality 1080p
+        else:  # 'low'
+            # Low quality with basic mp4v codec, no upscaling
+            fourcc = cv2.VideoWriter_fourcc(*'mp4v')
+            fps = 20
+            scale_factor = 1.0
+            bitrate = 1000000  # 1 Mbps
         
-        # Write frames
+        # Calculate new dimensions if scaling
+        new_width = int(width * scale_factor)
+        new_height = int(height * scale_factor)
+        
+        # Try H.264 first, fallback to alternatives if not available
+        try:
+            video = cv2.VideoWriter(filename, fourcc, fps, (new_width, new_height))
+            # Test if writer is properly initialized
+            if not video.isOpened():
+                raise Exception(f"{fourcc} codec not available")
+        except Exception as e:
+            print(f"{fourcc} codec not available, falling back to mp4v: {e}")
+            fourcc = cv2.VideoWriter_fourcc(*'mp4v')
+            video = cv2.VideoWriter(filename, fourcc, fps, (new_width, new_height))
+        
+        # Apply enhanced bitrate if using OpenCV 4.1+
+        try:
+            video.set(cv2.VIDEOWRITER_PROP_QUALITY, 100)  # Maximum quality
+            if hasattr(cv2, 'VIDEOWRITER_PROP_BITRATE'):
+                video.set(cv2.VIDEOWRITER_PROP_BITRATE, bitrate)
+        except:
+            print("Note: Enhanced bitrate settings not supported in this OpenCV version")
+        
+        # Write frames with upscaling if needed
         for frame in self.episode_frames:
+            if scale_factor != 1.0:
+                frame = cv2.resize(frame, (new_width, new_height), interpolation=cv2.INTER_LANCZOS4)
             video.write(cv2.cvtColor(frame, cv2.COLOR_RGB2BGR))
         
         # Release video writer
         video.release()
-        print(f"Saved video to {filename}")
+        print(f"Saved {self.video_quality} quality video ({new_width}x{new_height}) to {filename}")

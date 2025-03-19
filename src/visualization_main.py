@@ -26,6 +26,10 @@ import numpy as np
 import sys
 import time
 
+# Set non-interactive matplotlib backend to avoid GUI errors
+import matplotlib
+matplotlib.use('Agg')
+
 from src.global_settings import IMAGE_SIZE, IMAGE_DEPTH
 from src.reinforcement_learner import LoggingProximalPolicyTrainer
 from src.helper_funcs import create_parallel_envs, atomic_save
@@ -87,6 +91,15 @@ def parse_args():
                       help='Only run visualization without training')
     parser.add_argument('--max_episodes', type=int, default=100,
                       help='Maximum episodes for visualization mode')
+    
+    # Video quality settings
+    parser.add_argument('--video_quality', type=str, default='high',
+                      choices=['low', 'medium', 'high', 'ultra'], 
+                      help='Quality of recorded videos (ultra=1080p)')
+    parser.add_argument('--display_width', type=int, default=800,
+                      help='Width of the display window')
+    parser.add_argument('--display_height', type=int, default=600,
+                      help='Height of the display window')
     
     # Training settings
     parser.add_argument('--worker_start', type=int, default=0,
@@ -175,7 +188,10 @@ def train_with_visualization(args):
         display_env_idx=args.display_env,
         video_record_freq=args.video_freq,
         display=args.display,  # Pass display flag
-        record_video=args.record_video  # Pass record flag
+        record_video=args.record_video,  # Pass record flag
+        display_width=args.display_width,
+        display_height=args.display_height,
+        video_quality=args.video_quality
     )
 
     # Create PPO trainer
@@ -240,7 +256,10 @@ def visualize_only(args):
         env=env,
         save_dir=args.video_dir,
         display=args.display,
-        record_episodes=args.record_video
+        record_episodes=args.record_video,
+        video_quality=args.video_quality,
+        display_width=args.display_width,
+        display_height=args.display_height
     )
     
     # Get observation space shape and format it for CNN
